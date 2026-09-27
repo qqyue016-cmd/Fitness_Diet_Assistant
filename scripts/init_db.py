@@ -2,6 +2,7 @@ from utils.path_tool import get_abs_path
 from utils.config_tool import config_foods_data
 from db import create_table, insert_data
 import csv
+from utils.logger_tool import logger
 
 def get_data():
     data = []
@@ -21,10 +22,15 @@ def get_data():
     return data
 
 def init_table():
+
     create_table()
     data = get_data()
     n = insert_data(data)
-    print(f'数据导入成功,导入了{n}条数据')
+    logger.info('数据导入成功，共 %d 条', n)
+
 
 if __name__ == '__main__':
-    init_table()
+    try:
+        init_table()
+    except Exception as e:
+        logger.error(f'数据库创建失败:{str(e)}')
