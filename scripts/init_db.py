@@ -3,6 +3,7 @@ from utils.config_tool import config_foods_data
 from db import create_table, insert_data
 import csv
 from utils.logger_tool import logger
+import sys
 
 def get_data():
     data = []
@@ -33,4 +34,5 @@ if __name__ == '__main__':
     try:
         init_table()
     except Exception as e:
-        logger.error(f'数据库创建失败:{str(e)}')
+        logger.error('数据库创建失败：%s', e, exc_info=True)
+        sys.exit(1)
