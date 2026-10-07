@@ -1,2 +1,3 @@
 DB_PATH: data/foods.db
 TABLE_NAME: foods
+INTAKE_TABLE: intake
