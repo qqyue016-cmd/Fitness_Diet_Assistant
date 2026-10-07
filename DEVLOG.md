@@ -623,3 +623,137 @@ PRAGMA table_info(foods) → name / kcal / protein / fat / carb / source  全部
 - **变异测试**：去掉 `NOT NULL`，恰好 1 条失败且正是那条约束测试——证明测试不是空壳
 - **不做某个检查的理由**：主动说"我评估过自洽性校验，但因为它有已知误报而放弃，改为依赖 source 字段的可追溯性"——**知道为什么不做什么，和知道做什么同样重要**
 - **数据局限的诚实表述**（配合设计文档 4.1 的话术）：13 条只有生重值、3 条典型值、未逐条核验原文 → **"知道数据哪里不准，比声称数据都准更有说服力"**
+
+---
+
+## 2026-10-07（续）｜ 摄入记录数据层：intake 表 + 三个函数 + 测试
+
+### 一、今日目标
+
+在 `db` 层打通「记录摄入」的读写能力，为后续 `service.build_daily_report` 提供数据入口。范围：intake 表结构、三个数据层函数、配套测试。另外顺手修正 `foods` 表一个遗留的主键设计问题。
+
+### 二、完成的事
+
+**1. `foods` 主键修正：`PRIMARY KEY (name, source)` → `PRIMARY KEY (name)`**
+
+原复合键预设了「同一食物可存多个来源版本」，但该能力从未被需求验证（104 条数据 `name` 全部唯一），且应用层根本用不了——`query_food(name) -> dict | None` 只能返回一行，`calc_food_intake` 也只需要一组确定性数字。改为 `name` 单主键后，唯一性由数据库保证，`query_food` 的语义变得明确。
+
+连带修改两处（否则直接报错）：
+- upsert 冲突目标：`ON CONFLICT(name, source)` → `ON CONFLICT(name)`
+- `DO UPDATE SET` 列表补上 `source = excluded.source`——`source` 从主键成员变成普通列后，不放进 SET 就意味着「修正来源标签」会被静默丢弃
+
+**2. intake 表**
+
+```sql
+CREATE TABLE IF NOT EXISTS intake (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    date      TEXT NOT NULL,
+    food      TEXT NOT NULL,
+    grams     REAL NOT NULL
+)
+```
+
+设计取舍：
+- **不存营养值快照**，只存「吃了什么、多少克」。营养值读 `foods` 表计算 → `db` 不依赖 `calc`，两层平行；且修正 `foods` 数值后历史记录自动跟随（单一事实来源）
+- **`id` 保留**：用途不是「数据库规范要求」，而是**删除/定位单条记录**。实测两条完全相同的记录（同日同食物同克数），无 id 时 `DELETE WHERE date=? AND food=? AND grams=?` 会一次删掉两条
+- **去掉 `meal`**：V1 的核心闭环是「当天摄入合计 vs 目标」，全天加总，从不按餐次分组
+- **去掉 `created_at`**：`date` 回答「哪天」、`id` 回答「先后」，信息重合
+
+**3. 三个函数 + 一个共用辅助函数**
+
+| 函数 | 签名 | 职责 |
+|---|---|---|
+| `_normalize_date` | `(date: str) -> str` | 校验并规范化为 `YYYY-MM-DD`；`add_intake` 与 `list_intake_by_date` 共用 |
+| `add_intake` | `(date, food_name, grams) -> int` | 三道校验（日期、克数 > 0、食物须在库中）后插入，返回新记录 id |
+| `list_intake_by_date` | `(date) -> list[dict]` | 取某日全部记录，`ORDER BY id` 保证顺序稳定 |
+| `delete_intake` | `(intake_id) -> int` | 按 id 删除，返回受影响行数 |
+
+**4. 测试：22 → 46 条**
+
+新增 14 条摄入用例，含三条**回归防线**：
+- `test_add_intake_normalizes_date`（写入侧规范化）
+- `test_list_intake_normalizes_date`（查询侧规范化）
+- `test_delete_intake_only_removes_target`（重复记录下按 id 只删一条）
+
+测试隔离用专属日期 `TEST_DATE = '1900-01-01'` + function scope 的 `clean_intake` fixture，**只删自己那天，绝不清空整表**（保护将来录入的真实数据）。
+
+**5. 变异测试（验证测试不是空壳）**
+
+| 植入的缺陷 | 结果 |
+|---|---|
+| `list_intake_by_date` 跳过规范化 | 恰好 1 条失败：`test_list_intake_normalizes_date` ✓ |
+| `delete_intake` 把 `WHERE id = ?` 改成 `WHERE id >= ?` | 恰好 1 条失败：`test_delete_intake_only_removes_target` ✓ |
+| 还原后 | 46 passed ✓ |
+
+**6. 端到端联调（提前验证块 3 的链路）**
+
+用 3 条记录跑通 `list_intake_by_date → query_food → calc_food_intake → sum_intake → calc_gap`：
+
+```
+鸡胸肉 200g + 白米饭 150g + 鸡蛋 100g
+当天合计：kcal 680.0  | 蛋白 78.65g | 脂肪 18.25g | 碳水 43.4g
+目标    ：kcal 2983.46| 蛋白 126.0g | 脂肪 63.0g  | 碳水 478.11g
+缺口    ：kcal 2303.46| 蛋白 47.35g | 脂肪 44.75g | 碳水 434.71g
+```
+
+结论：`db` 层与 `calc` 层的接口完全对齐（键名、量纲、单位均一致）。
+
+### 三、遇到的问题与解决过程
+
+**问题 1：一个字符串里写两条 `CREATE TABLE` 跑不通**
+
+- 现象：`sqlite3.OperationalError: near "CREATE": syntax error`
+- 三个叠加的问题：
+  1. 两条语句之间**缺分隔符 `;`**
+  2. 列定义末尾多了**尾逗号**（`grams REAL NOT NULL,` 后直接 `)`）→ SQL 不允许，与 Python 元组的习惯相反
+  3. **即使补上分号也不行**——Python `sqlite3` 的 `cursor.execute()` **一次只能执行一条语句**，加 `;` 后报 `ProgrammingError: You can only execute one statement at a time.`
+- 解决：拆成**两个字符串 + 两次 `cursor.execute()`**（`conn.executescript()` 也可行，但它会隐式 commit 且不返回 cursor，与现有 `try/finally + cursor.close()` 结构不合）
+- 收获：**`cursor.execute` 是「执行一条语句」，不是「执行一段脚本」**
+
+**问题 2：改了 schema 却直接跑 `init_db`，报 `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`**
+
+- 现象：代码里主键已改成 `(name)`，但插入时报冲突目标不存在
+- 原因：`CREATE TABLE IF NOT EXISTS` **见到表已存在就整段跳过、不做任何结构变更** → 库里仍是旧主键 `(name, source)`，而 `ON CONFLICT(name)` 找不到对应约束
+- 解决：`DROP TABLE IF EXISTS foods` → 重跑 `init_db` 重建
+- 收获：**`CREATE TABLE IF NOT EXISTS` 不是迁移工具**。它只保证「表存在」，不保证「表结构正确」。改 schema 必须显式 `DROP`（重建）或 `ALTER`（改列）。这个坑当天在 intake 表和 foods 表上各踩了一次
+
+**问题 3：`delete_intake` 里的 `if cursor.execute(...) is not None:` 是死分支**
+
+- 现象：删不到记录时也能正常返回 0，看起来没问题
+- 原因：`cursor.execute()` 返回的是**游标本身**，永远不是 `None` → `if` 恒为真，`else` 分支一次都不会执行；而且两个分支做的事完全相同
+- 解决：删掉 if/else，直接 `cursor.execute(...)` + `conn.commit()` + `return cursor.rowcount`（无匹配时 rowcount 自然为 0）
+- 收获：**不需要判断「执行是否成功」**——失败会抛异常，走不到 return；成功与否看 `rowcount` 就够了
+
+**问题 4：`__main__` 自测块硬编码删除 id 1~8**
+
+- 原因：`for r in range(1, 9): delete_intake(r)`——写死了记录 id
+- 风险：当前因 `AUTOINCREMENT` 已推进到 10 而无实际删除，但**数据库一旦重建（id 从头开始）就会删掉刚录入的前 8 条真实记录**
+- 解决：改为非破坏性演示（专属日期 + 自己造自己删）
+- 收获：**自测块也是会写数据库的代码**，任何「删除/清空」操作都不该写死在脚本里
+
+**一行记**
+
+- **`DO UPDATE SET` 漏列**：`source` 从主键降为普通列后忘了加进 SET 列表——不报错，但会使该列的修正静默失效
+- **复合键的来源**：`(name, source)` 是我早期给的示例里带进来的，理由（支持多来源）从未被验证；`source` 是**属性**不是**身份**，本就不该进主键
+- **变异测试自身要验证**：第一次做变异时替换串没匹配上（变量已改名），脚本仍打印「已植入」，测试显示 46 passed，**看起来像「测试没抓住」，实际是变异没生效**。变异测试的第一步必须是「确认缺陷真的植入」
+- **多行命令不要跨行粘贴**：终端会把首行 `python.exe -c "` 与后续代码拆开，导致参数被当成命令执行
+
+### 四、可迁移的规则（本段沉淀）
+
+1. **主键 = 实体的身份标识，属性不进主键。** 定主键的标准动作是自问「这个实体靠什么唯一区分」
+2. **`CREATE TABLE IF NOT EXISTS` 不是迁移工具**——改 schema 必须显式 DROP 或 ALTER
+3. **`cursor.execute()` 一次只能执行一条语句**，多条要用多次 execute 或 `executescript`
+4. **同一格式契约要在两端都做**：写入侧规范化保证库内格式唯一，读取侧规范化保证查询串能对上——只做一端不成立
+5. **`finally` 里只关闭在 try 之前就已创建的资源**（沿用自 9-22）
+6. **自测块不得包含破坏性操作**（硬编码 id 的删除、清空整表）
+7. **变异测试的第一步是确认缺陷真的植入**，否则会得出反向结论
+8. **不存快照 = 单一事实来源**：intake 只记事实，营养值查 `foods` 计算，避免两处数字
+
+### 五、今天产出的面试素材
+
+- **「为什么表里需要 id」**：不是因为「数据库规范」，而是**删除/定位单条记录**需要。用「两条完全相同的记录，无 id 时删一条会删掉两条」这个具体场景回答，比背主键定义有说服力
+- **「主键怎么定」**：先问「这个实体靠什么唯一区分」。食物靠名称唯一 → `PRIMARY KEY (name)`；`source`（数值来源）是属性不是身份。**反例**：把属性塞进主键，会让「属性变了」变成「这是一条新记录」，并让「按名称取一条」的调用方面临「该取哪条」的无解问题
+- **「数据库表结构怎么维护/迁移」**：V1 用 DROP + 重导（数据源是 CSV，可完全重建）；生产环境会用 Alembic 这类迁移工具，因为不能丢数据。可以补一句**踩过的坑**：「`CREATE TABLE IF NOT EXISTS` 不是迁移工具，它连结构不一致都不会告诉你」
+- **「为什么不存营养值快照」**：单一事实来源——改 `foods` 数值后历史记录自动跟随；同时避免 `db` 依赖 `calc`（破坏分层）。生产环境（如 MyFitnessPal）倾向存快照以求「历史不可变」，切换成本很低（加几个字段即可）
+- **日期为什么既校验又规范化**：数据库 `date` 是 TEXT，`WHERE date = ?` 是**字符串全等比较**。只校验不规范化 → 传 `'2026-1-1'` 时静默返回空列表，调用方无法区分「这天没记录」和「格式传错」——**静默错误比报错难查得多**
+- **测试作为设计的固化**：`test_delete_intake_only_removes_target` 把一个架构决策（为什么需要 id）固化成了断言；将来有人想删掉 id，这条测试会告诉他删了会出什么问题
