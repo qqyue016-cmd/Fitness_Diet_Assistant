@@ -13,13 +13,16 @@ def create_table():
     conn = get_connect()
     cursor = conn.cursor()
     try:
+        # 四个营养字段均为 NOT NULL：
+        # 数据完整性由本约束（而非上层校验）保证，因此 calc 层不做缺失值处理。
+        # 若将来数据源变更（如接入外部 API 且允许字段缺失），需同步放开此处并恢复上层处理。
         sql_text = f'''
         CREATE TABLE IF NOT EXISTS {config_sqlite['TABLE_NAME']} (
             name    TEXT NOT NULL,
-            kcal    REAL,
-            protein REAL,
-            fat     REAL,
-            carb    REAL,
+            kcal    REAL NOT NULL,
+            protein REAL NOT NULL,
+            fat     REAL NOT NULL,
+            carb    REAL NOT NULL,
             source  TEXT NOT NULL,
             PRIMARY KEY (name, source)
         )
