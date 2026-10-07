@@ -1,6 +1,8 @@
+import sqlite3
+
 import pytest
 
-from db import query_food, search_foods
+from db import get_connect, query_food, search_foods
 from scripts.init_db import init_table
 
 
@@ -44,3 +46,23 @@ def test_search_foods_hit():
 
 def test_search_foods_no_result():
     assert search_foods('火鸡') == []
+
+
+# ── 数据完整性约束 ────────────────────────────────────
+def test_foods_rejects_null_nutrient():
+    """营养字段的 NOT NULL 约束必须生效。
+
+    这是 calc 层不做缺失值处理的前提：完整性由数据库约束保证，
+    而非靠上层「约定」或人工把关。
+    """
+    conn = get_connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                'INSERT INTO foods (name, kcal, protein, fat, carb, source) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                ('约束测试食物', 100.0, None, 1.0, 1.0, 'TEST'),
+            )
+    finally:
+        conn.rollback()
+        conn.close()
