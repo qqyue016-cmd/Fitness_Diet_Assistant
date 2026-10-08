@@ -12,24 +12,7 @@ from db import (
 )
 from scripts.init_db import init_table
 
-TEST_DATE = '1900-01-01'
-
-
-@pytest.fixture(scope='module', autouse=True)
-def ensure_db():
-    """把库准备到可用状态。init_table 无参数、幂等（upsert），可反复执行。"""
-    init_table()
-
-
-@pytest.fixture(autouse=True)
-def clean_intake():
-    """每个用例跑完后，只清理本测试专属日期，绝不触碰真实数据。"""
-    yield
-    conn = get_connect()
-    conn.execute('DELETE FROM intake WHERE date = ?', (TEST_DATE,))
-    conn.commit()
-    conn.close()
-
+from tests.conftest import TEST_DATE
 
 
 # ── query_food：精确查询 ──────────────────────────────
