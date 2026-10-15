@@ -1,2 +1,5 @@
 PyYAML==6.0.3
 streamlit==1.65.0
+dashscope==1.27.7
+langchain==1.4.6
+langchain_community==0.4.2

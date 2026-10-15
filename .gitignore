@@ -4,4 +4,4 @@ __pycache__/
 .venv/
 data/*.db
 logs/*.log
-
+.env
