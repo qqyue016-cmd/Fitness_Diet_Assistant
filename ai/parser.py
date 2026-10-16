@@ -1,6 +1,7 @@
 from ai.client import chat_model
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+import ai.guard
 
 prompt = ChatPromptTemplate.from_messages(
     [
@@ -26,3 +27,6 @@ if __name__ == '__main__':
     print(a)
     print(b)
     print(c)
+    print(ai.guard.validate_meal(a),
+          ai.guard.validate_meal(b),
+          ai.guard.validate_meal(c))
