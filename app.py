@@ -3,6 +3,7 @@ import db
 import service
 from datetime import datetime
 from utils.config_tool import config_calc
+from ai.pipeline import parse_and_validate
 
 ACTIVITY_LABELS = {"sedentary": "久坐", "light": "轻度活动", "moderate": "中度活动",
                    "high": "高度活动", "extreme": "极高活动"}
@@ -21,12 +22,12 @@ with st.sidebar:
     # 身高输入
     height = st.number_input("身高(cm)", min_value=100.0, max_value=250.0, value=175.0, step=0.5)
     # 年龄输入
-    age = st.number_input('年龄',min_value=10,max_value=100,value=18,step=1)
+    age = st.number_input('年龄',min_value=10,max_value=80,value=18,step=1)
     # 活动水平选择器
     act_opts = list(config_calc["ACTIVITY_FACTORS"])
-    # 目标选择器
     activity = st.selectbox("活动水平",  options=act_opts, index=act_opts.index("moderate"),
                  format_func=lambda k: ACTIVITY_LABELS[k])
+    # 目标选择器
     goal = st.selectbox("目标", options=list(config_calc["GOAL_KCAL_FACTOR"]), format_func=lambda k: GOAL_LABELS[k])
 
     # 按钮生成计划
@@ -54,7 +55,88 @@ with tab2:
     d = st.date_input("日期", value=datetime.now().date())
     date_str = d.isoformat()
 
+    #——————————ai记录———————————
+    st.divider()
+    st.subheader('一句话记录（AI）')
+    text = st.text_input("请输入一句话描述今天吃的食物(如：我今天吃了150克鸡蛋)")
+    if st.button('提交',key='parse_btn'):
+        if not text.strip():
+            st.warning('请输入内容')
+        else:
+            with st.spinner('解析中...'):
+                st.session_state['parsed'] = parse_and_validate(text)
+
+    parsed = st.session_state.get('parsed')
+    if parsed:
+        if sum(len(s) for s in parsed.values()) == 0:
+            st.info("没有识别到任何食物，换个说法试试？")
+        else:
+            if parsed["ok"]:
+                st.success(f"可直接添加（{len(parsed['ok'])} 项）")
+                for i, item in enumerate(parsed["ok"]):
+                    c1, c2 = st.columns([4, 1])
+                    c1.write(f"{item['raw']} → {item['food']} {item['grams']}g")
+                    if c2.button("添加", key=f"add_ok_{i}"):
+                        db.add_intake(date_str, item["food"], item["grams"])
+                        parsed["ok"].pop(i)  # 已处理，移出待确认
+                        st.session_state["parsed"] = parsed
+                        st.rerun()
+
+            if parsed["ambiguous"]:
+                st.warning(f'需确认（{len(parsed["ambiguous"])} 项）')
+                for i, item in enumerate(parsed["ambiguous"]):
+                    c1, c2 = st.columns([4, 1])
+                    for j, candidate in enumerate(item["candidates"]):
+                        c1.write(f"{item['raw']} → {candidate}{item['grams']}")
+                        if c2.button("添加", key=f"add_amb_{i}_{j}"):
+                            db.add_intake(date_str, candidate, item["grams"])
+                            parsed["ambiguous"].pop(i)  # 已处理，移出待确认
+                            st.session_state["parsed"] = parsed
+                            st.rerun()
+
+            if st.button("清空待确认", key="clear_parsed"):
+                st.session_state.pop("parsed", None)
+                st.rerun()
+
+            if parsed["not_found"]:
+                st.error(f'未找到（{len(parsed["not_found"])} 项）')
+                for i, item in enumerate(parsed["not_found"]):
+                    c1, c2, c3 = st.columns([3, 3, 1])
+                    c1.write(f"{item['raw']} ({item['grams'] or '克数待补'} )")
+
+                    revise = c2.text_input('请输入修改的食物',
+                                           key=f"revise_input_{i}",
+                                           label_visibility="collapsed",
+                                           placeholder="输入库中已有的食物名")
+                    if c3.button('修改', key=f"revise_{i}"):
+                        if not revise.strip():
+                            st.warning('请输入修改内容')
+                        elif item['grams'] is None:
+                            st.warning('该项缺少克数，无法添加')
+                        else:
+                            result = db.query_food(revise)
+                            if result:
+                                db.add_intake(date_str, result["name"], item["grams"])
+                                parsed["not_found"].pop(i)  # 已处理，移出待确认
+                                st.session_state["parsed"] = parsed
+                                st.rerun()
+                            else:
+                                st.warning(f'数据库中未找到 {revise},试试更完整的名称')
+
+            if parsed["invalid"]:
+                st.error(f'数据错误（{len(parsed["invalid"])} 项）')
+                for i, item in enumerate(parsed["invalid"]):
+                    c1, c2 = st.columns([5, 1])
+                    c1.write(f"{item['raw']}  {item['grams']}g — {item['reason']}")
+                    if c2.button("忽略", key=f"ignore_inv_{i}"):
+                        parsed["invalid"].pop(i)
+                        st.session_state["parsed"] = parsed
+                        st.rerun()
+
+    #——————————手动记录——————————
     # 食物选择器和克数输入
+    st.divider()
+    st.subheader('手动记录')
     foods = [f["name"] for f in db.search_foods("")]  # 全部食物名
     food = st.selectbox("食物", options=foods)
     grams = st.number_input("克数(g)", min_value=1.0, value=100.0, step=10.0)
@@ -74,7 +156,7 @@ with tab2:
 
     # 记录列表+删除
     st.divider()
-    st.subheader('今日记录')
+    st.header('今日记录')
     if not report['items']:
         st.info('今天还没记录')
     else:
@@ -100,7 +182,7 @@ with tab2:
 
     # 汇总
     st.divider()
-    st.subheader('汇总')
+    st.header('汇总')
     c = st.columns([1.4, 1, 1, 1, 1])
     c[1].write("热量(kcal)")
     c[2].write("蛋白质(g)")
