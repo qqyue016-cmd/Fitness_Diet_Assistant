@@ -32,6 +32,11 @@ def test_validate_meal_ambiguous():
     assert result['ambiguous'][0]['candidates'][1] == "糙米饭"
 
 
+def test_ambiguous_carries_grams():
+    r = validate_meal([{"food": "米饭", "grams": 150}])
+    assert r["ambiguous"][0]["grams"] == 150
+
+
 def test_validate_meal_grams_is_None():
     result = validate_meal([{"food": "鸡蛋", "grams": None}])
     assert result['ok'][0]['raw'] == "鸡蛋"

@@ -42,7 +42,7 @@ def validate_meal(items: list[dict]) -> dict:
     输入：[{"food": "米饭", "grams": 150}, ...]        ← parser 的输出
     输出：{
         "ok":        [{"raw", "food", "grams"}],       # 唯一命中，可直接写库（grams 可能为 None，待用户补）
-        "ambiguous": [{"raw", "candidates"}],          # 需用户从候选中选
+        "ambiguous": [{"raw", "candidates", "grams"}],          # 需用户从候选中选
         "not_found": [{"raw", "grams"}],               # 库中无，需用户确认或换词
         "invalid":   [{"raw", "grams", "reason"}],     # 克数非法
     }
@@ -75,7 +75,7 @@ def validate_meal(items: list[dict]) -> dict:
             )
         elif match["status"] == "ambiguous":
             reslut['ambiguous'].append(
-                {'raw': raw, 'candidates': [c['name'] for c in match['candidates']]}
+                {'raw': raw, 'candidates': [c['name'] for c in match['candidates']], 'grams': grams}
             )
         else:
             reslut['not_found'].append(
