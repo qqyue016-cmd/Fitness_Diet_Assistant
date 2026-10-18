@@ -1166,3 +1166,193 @@ text_input + 提交按钮
 - **「你的护栏有什么局限」**（诚实版答案）：护栏保证输出合法，但不保证理解正确。实测模型会把 `-50克` 转录成 `50克`，输出本身合法，护栏拦不住。根本解法是引入原文数值对账（提取原文数字与模型输出比对），当前版本未实现，只做了 prompt 约束
 - **「V2 和 V3 的交互形态为什么不同」**：V2 是 workflow（控制流在代码手里），确认环节用表单式最直接；V3 是 agent（控制流在模型手里），对话式才自然。对话式确认的隐藏成本是"意图区分"——要判断用户这句话是"回答问题"还是"新输入"，这本身就是 agent 的职责
 - **「AI 功能怎么接入既有系统」**：`ai/` 作为上层包，通过 `service`/`db` 落库，不反向依赖。验证方式同样是看 import——**删掉 `ai/` 目录，原始功能必须完好无损**
+
+## 2026-10-18 ｜ V2 第四块：Tool Calling（Agent 查询链路）
+
+### 一、今日目标
+
+把只读查询能力交给模型自主调度：用户自然语言提问 → 模型自己决定调哪个工具、调几次 → 基于工具结果作答。同时要求流式输出。
+
+与已有的「记录链路」并列，形成两条互不干扰的通道：
+
+| 链路 | 入口 | 用途 | 写库 |
+|---|---|---|---|
+| 记录 | `pipeline.parse_and_validate` | 「我吃了米饭」→ 结构化 → 护栏 → 人工确认 | ✅ |
+| 查询 | `agent.chat_stream` | 「鸡胸肉多少卡」→ 模型选工具 → 作答 | ❌ |
+
+**写操作绝不暴露给模型**：`add_intake` 不进 `tools` 列表。模型可以查，不能写——这是护栏和人工确认环节存在的前提。
+
+### 二、完成的事
+
+**1. 框架选型：`create_agent`（LangChain 1.x）**
+
+```python
+create_agent(model=chat_model, tools=TOOLS, context_schema=UserCtx, system_prompt=...)
+```
+
+一次调用就把「模型 → 判断 tool_calls → 执行工具 → 回填 ToolMessage → 再调模型」的循环封好了。不需要 `AgentExecutor`、不需要 `agent_scratchpad`、不需要手写 `execute_tool`。
+
+**2. `ai/tools.py`：4 个只读工具 + 上下文**
+
+```python
+@dataclass
+class UserCtx:
+    target: dict      # 每日营养目标
+    today: str        # "2026-10-18"
+```
+
+| 工具 | 参数 | 用途 |
+|---|---|---|
+| `today_report` | **无** | 今天的摄入与缺口 |
+| `report_by_date` | `date` | 指定日期 |
+| `search_foods_tool` | `keyword` | 名称不完整时模糊搜索 |
+| `query_food_tool` | `name` | 名称确定时精确查询 |
+
+`target` 和 `today` 通过 `ToolRuntime[UserCtx]` 注入，**不进 prompt、不耗 token、不依赖 UI**。
+
+**3. `ai/agent.py`：`_make_agent` + `chat_stream`**
+
+`chat_stream` yield 三类事件，把「数据通道」和「展示通道」分开：
+
+```python
+{"type": "text",        "content": "鸡"}            # 正文片段
+{"type": "tool",        "name": "query_food_tool", "id": "call_xxx"}
+{"type": "tool_result", "content": "[{...}]", "id": "call_xxx"}
+```
+
+**4. `ai/client.py`：`streaming=True`**
+
+**5. 实测结果**
+
+```
+[tool search_foods_tool]
+[tool_result ]
+鸡胸肉每100克含165千卡（kcal），蛋白质31克，脂肪3.6克，碳水化合物0克。
+```
+
+全量测试 **65 passed**，`parser.py` 的 `invoke` 链路未受影响。
+
+### 三、遇到的问题与解决过程
+
+**1. 框架代际混淆：`AgentExecutor` 是 0.x 的产物**
+
+我先给出的方案是 `create_tool_calling_agent` + `AgentExecutor` + `agent_scratchpad`，被指出「之前项目没这么麻烦」。
+
+核实后发现 LangChain 1.x 提供了 `create_agent`，只需 `model` / `tools` / `system_prompt` 三个参数，旧项目用的正是它。
+
+**教训**：框架经验要标版本。0.x 和 1.x 创建 agent 的方式完全不同，拿旧文档套新版本会凭空多出一层复杂度。
+
+**2. 参数顺序导致的 SyntaxError**
+
+```python
+def build_daily_report_tool(date: str | None = None, runtime: ToolRuntime[UserCtx]) -> str:
+#                              ↑ 有默认值              ↑ 无默认值 → 语法错误
+```
+
+报错：`parameter without a default follows parameter with a default`。
+
+**这跟 LangChain 无关，是 Python 的语法规则**。改法是把 `runtime` 提到前面。参数顺序不影响模型——模型按参数名传，不看位置。
+
+**3. 模型填 `date` 完全不可靠（本日最重要的发现）**
+
+让模型查询「今天还剩多少热量」，三次实测三种行为：
+
+| 次数 | 模型传的 date |
+|---|---|
+| 1 | `'2023-10-05'`（瞎猜） |
+| 2 | `{}`（空参，兜底生效） |
+| 3 | `'2024-05-17'`（又瞎猜） |
+
+实际日期是 2026-10-18。**模型不知道今天几号**——训练数据有截止日期，它也没有系统时钟。
+
+更关键：`date or runtime.context.today` 这个兜底**只在模型不填时生效**，它一旦填了错的，兜底就被绕过。
+
+**解法：把「今天」和「指定日期」拆成两个工具**
+
+```python
+@tool
+def today_report(runtime: ToolRuntime[UserCtx]) -> str:
+    """查询【今天】的摄入与缺口。无参数。"""
+    r = build_daily_report(runtime.context.today, runtime.context.target)
+```
+
+无参数 = 模型想瞎填也没地方填。而 `report_by_date` 的 `date` 只在用户明确说出日期时使用，此时模型是**转录**用户原话，不是**推断**。
+
+实测：
+
+```
+问：我今天还剩多少热量额度？   →  [('today_report', {})]                        ✅
+问：10月15日我吃了多少？       →  [('report_by_date', {'date': '2026-10-15'})]  ✅
+```
+
+第二条它自己补了年份 2026——因为 system_prompt 里写了「今天日期：{today}」。**prompt 该干的是提供事实，不是要求模型守护规则。**
+
+**4. 模型传非 ISO 日期，把 agent 打崩**
+
+输入「10月15日我吃了多少」，模型传了 `10月15日` 这种格式，`_normalize_date` 抛 `ValueError`，整条链中断，用户看到红色 traceback。
+
+**解法：工具永不抛异常，把错误当数据返回**
+
+```python
+try:
+    r = build_daily_report(date, runtime.context.target)
+except ValueError:
+    return f"日期 {date} 格式不合法，请转换为 YYYY-MM-DD 后重试。"
+```
+
+模型看到这句话会自己纠正或转而问用户。**抛异常 = 整条链断；返回错误说明 = 一次可恢复的对话轮次。**
+
+**5. 不开 `streaming=True`，流式只是个假象**
+
+同一个问题，两种配置：
+
+| 配置 | chunk 数 | 粒度 |
+|---|---|---|
+| 默认 | **3 个** | 整段消息（用户问题 / 工具 JSON / 整段答案） |
+| `streaming=True` | **28 个** | 逐字（`'鸡'` → `'胸肉，'` → ……） |
+
+`stream_mode="messages"` 只有在客户端开了流式时才产生 token 级 chunk，否则它只是「消息产生事件」。
+
+**6. chunk 有三种形态，不分类就会把 JSON 吐给用户**
+
+```
+[1] node=model  AIMessageChunk  content=''   tool_call_chunk(name='search_foods_tool', args='{"keyword')
+[2] node=model  AIMessageChunk  content=''   tool_call_chunk(name='', args='": "鸡胸肉"}')
+[3] node=model  AIMessageChunk  content=''   （空尾巴，连 tool_call_chunks 都没有）
+[4] node=tools  ToolMessage     content='[{"name": "鸡胸肉", ...}]'
+[5] node=model  AIMessageChunk  content='数据库'
+```
+
+三道过滤缺一不可：
+- `if chunk.content:` —— 挡住空 content（工具调用轮次）
+- `getattr(chunk, "tool_call_chunks", None) or []` —— 属性可能不存在、值可能为 None
+- `if c.get("name"):` —— 工具调用分 3 片到达，只有首片带 name
+
+**7. 复核旧项目：它确实会把用户问题和 JSON 打到界面上**
+
+我一度判断旧项目（扫地机器人客服）是「终端 demo」，实际它是完整的 Streamlit 聊天产品。但顺着代码看，它的 UI 会显示不该显示的内容：
+
+- `react_agent.py:24-26`：`yield lastest_message.content`，**没有任何类型过滤**
+- `app.py:28-33`：`capture()` 把每个 chunk 拆成单字，`time.sleep(0.01)` 逐个吐出
+- Streamlit `elements/write.py:350`：`st.write(generator)` 会自动转 `write_stream`
+
+三条串起来 → `HumanMessage`（用户的问题）和 `ToolMessage`（原始 JSON）都会逐字打进 assistant 气泡。
+
+另外 `time.sleep(0.01)` 是**人工伪造打字机**：500 字的答案要额外等 5 秒，而这 5 秒里模型的完整答案早就到了。新方案用 `streaming=True` 是真流式，不需要 sleep。
+
+### 四、可迁移的规则（今天沉淀下来的）
+
+- **「凡是需要模型推断的参数，都应该被消灭掉」**：模型不知道今天几号，就别给它 `date` 参数。拆成无参的 `today_report` 和转录型的 `report_by_date`，比在 prompt 里写十句「今天是 X 月 X 日」可靠得多。**prompt 提供事实，schema 约束行为。**
+- **「工具永远不抛异常，错误当数据返回」**：工具是模型的手脚，手脚抽筋不能让人晕过去。`try/except` 后返回一句可读的错误说明，模型能自行纠正；抛异常则整条链中断。
+- **「数据通道与展示通道必须分离」**：`yield` 裸字符串，消费端只能全显示或全不显示；`yield` 事件字典，UI 只挑 `type == "text"` 渲染，其余进日志。**生产端不隐瞒，消费端有选择权。**
+- **「流式优先于伪造」**：`time.sleep` 逐字打印是假流式，答案越长等得越久。
+- **「框架经验要标版本」**：`AgentExecutor` 属于 0.x，`create_agent` 属于 1.x。判断写法是否适用，先确认版本。
+- **「工具越少越好」**：`list_intake_by_date` 与 `report_by_date` 功能重叠时删掉前者。**工具之间一旦互为子集，带来的不是能力，是歧义。**
+
+### 五、今天产出的面试素材
+
+- **「你怎么让模型知道今天是几号」**：模型没有系统时钟，训练数据有截止日期。实测同一问题三次得到 `2023-10-05` / 空 / `2024-05-17`。所以日期必须由代码注入——无参工具用 `runtime.context.today`，prompt 里也写明日期供它组织语言。
+- **「工具调用里哪些参数不该给模型」**：凡是「事实」（今天几号、用户目标多少、库里有什么）都不该让模型推断。**模型只负责理解意图和选择工具，事实由代码提供。**
+- **「你的 agent 怎么防止乱调工具」**：三层——① 只暴露只读工具，写操作走需要人工确认的另一条链路；② 工具 description 写清边界（何时用 A、何时用 B）；③ 实测「你好」这类问题 trace 为空，验证它不会为了用工具而用工具。
+- **「流式输出怎么实现」**：`streaming=True` + `stream_mode="messages"`，按 `langgraph_node` 分类（`model` / `tools`），按 `content` 是否为空过滤。区分「节点级流」（整段）与「token 级流」（逐字）——前者不需要开 streaming，后者必须。
+- **「为什么不用 sleep 伪造打字机」**：旧项目的 `time.sleep(0.01)` 会让 500 字答案额外等 5 秒，且这 5 秒完全无意义（内容早就到了）。真流式的等待是「模型真的在生成」，不是「代码在慢慢播放」。
