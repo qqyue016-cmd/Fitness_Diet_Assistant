@@ -3,7 +3,7 @@ import db
 import service
 from datetime import datetime
 from utils.config_tool import config_calc
-from ai.pipeline import parse_and_validate
+from ai.pipeline import parse_and_validate, AIServiceError
 
 ACTIVITY_LABELS = {"sedentary": "久坐", "light": "轻度活动", "moderate": "中度活动",
                    "high": "高度活动", "extreme": "极高活动"}
@@ -63,8 +63,11 @@ with tab2:
         if not text.strip():
             st.warning('请输入内容')
         else:
-            with st.spinner('解析中...'):
-                st.session_state['parsed'] = parse_and_validate(text)
+            try:
+                with st.spinner('解析中...'):
+                    st.session_state['parsed'] = parse_and_validate(text)
+            except AIServiceError:
+                st.error("解析服务暂时不可用，请稍后重试。手动记录仍可正常使用。")
 
     parsed = st.session_state.get('parsed')
     if parsed:
