@@ -1356,3 +1356,159 @@ except ValueError:
 - **「你的 agent 怎么防止乱调工具」**：三层——① 只暴露只读工具，写操作走需要人工确认的另一条链路；② 工具 description 写清边界（何时用 A、何时用 B）；③ 实测「你好」这类问题 trace 为空，验证它不会为了用工具而用工具。
 - **「流式输出怎么实现」**：`streaming=True` + `stream_mode="messages"`，按 `langgraph_node` 分类（`model` / `tools`），按 `content` 是否为空过滤。区分「节点级流」（整段）与「token 级流」（逐字）——前者不需要开 streaming，后者必须。
 - **「为什么不用 sleep 伪造打字机」**：旧项目的 `time.sleep(0.01)` 会让 500 字答案额外等 5 秒，且这 5 秒完全无意义（内容早就到了）。真流式的等待是「模型真的在生成」，不是「代码在慢慢播放」。
+
+## 2026-10-19 ｜ V2 第五块：AI 问答接入界面
+
+### 一、今日目标
+
+把 agent 的流式能力接进 Streamlit，新增第三个标签页「问问 AI」，支持多轮对话。
+
+### 二、完成的事
+
+**1. `chat_stream` 签名改为 messages 列表**
+
+```python
+def chat_stream(messages: list[dict], target: dict, today: str, goal: str = ""):
+    for chunk, meta in agent.stream({"messages": messages}, ...):
+```
+
+单轮只是「列表里只有一个元素」的特例，不需要两个函数。
+
+**2. tab3 的完整结构**
+
+```
+渲染历史 → 处理 pending_question → 输入框（form）
+```
+
+输入框必须最后执行才能固定在底部，所以用 `session_state["pending_question"]` + `st.rerun()` 实现「先存问题，再重跑处理」。
+
+**3. `system_prompt` 注入 `goal` 与四个数值**
+
+解决模型反复索要画像的问题（见第三节问题 6）。
+
+**4. 历史截断 + 异常兜底**
+
+```python
+MAX_HISTORY = 20
+if len(hist) > MAX_HISTORY:
+    hist = hist[-MAX_HISTORY:]
+while hist and hist[0]["role"] != "user":
+    hist.pop(0)
+```
+
+**5. 实测结果**
+
+```
+截断后条数: 19（期望 20，因首条为 assistant 被丢弃，以保证首条是 user）
+exception: []
+history: [('user', '我今天还剩多少热量'),
+          ('assistant', '今天还剩热量：3045.85 kcal（目标 3045.85…')]
+```
+
+全量测试 **65 passed**。
+
+### 三、遇到的问题与解决过程
+
+**1. `st.stop()` 把整个 tab3 吞掉了**
+
+现象：没生成计划时，tab3 连提示文字都不显示。
+
+根因：`st.stop()` 终止的是**整个脚本**，不是当前 tab。tab2 里的 `st.stop()` 执行后，排在它后面的 `with tab3:` 一行都没跑。
+
+修复：改成 `if / else` 结构。
+
+**教训**：多 tab 布局里禁用 `st.stop()`，它没有「只停当前容器」的语义。
+
+**2. `st.chat_input` 在 tab 内不固定在底部**
+
+现象：输入框夹在两条对话中间。
+
+根因：`chat_input` 的「固定底部」只在主容器生效，放进 `st.tabs` 后退化为普通元素，按代码顺序渲染。而处理逻辑必须先拿到输入，只能排在输入框之后，导致新消息画在输入框下面。
+
+修复：`pending_question` + `st.rerun()` 两阶段处理。
+
+**3. Streamlit 不重载被 import 的模块**
+
+改完 `ai/agent.py` 后页面仍报旧的 `NameError`。
+
+根因：Python 模块首次 import 后缓存在 `sys.modules`，`st.rerun()` 只重跑主脚本，不重新执行 import。
+
+修复：**改 `ai/` 下任何文件后必须重启 `streamlit run`**。
+
+**4. `buf` 变量被覆盖导致 `AttributeError`**
+
+```python
+buf = st.empty()      # 占位符对象
+buf = ""              # 立刻被覆盖成字符串
+buf.markdown(buf)     # str 没有 markdown 方法
+```
+
+修复：拆成 `box`（画布）和 `buf`（内容）两个变量。
+
+**5. 参数改名未同步引用**
+
+```python
+def chat_stream(messages: ...):     # 签名改成复数
+    {"messages": message}            # 函数体还在用单数 → NameError
+```
+
+修复：改参数名用 IDE 的 `Shift + F6`（Rename），不要手动改签名再手动改引用。
+
+**6. context 只喂给工具，模型看不见**
+
+现象：用户已经生成过计划，AI 仍然要求「请提供性别、年龄、身高、体重、目标」。
+
+根因：`target` 通过 `ToolRuntime` 注入，**只有工具函数能读到**，模型本身看不到。模型不知道用户已有画像，就按通用助手的行为索要。
+
+修复：同时写进 `system_prompt`——目标类型 + 四个数值。
+
+**7. 模型没有界面感知**
+
+用户说「我的目标是上面」，模型仍然反问「请明确你的目标」。
+
+根因：模型看不到界面，“上面”对它是个没有指代对象的短语；它也不知道那组数值对应的是「增肌」。
+
+修复：prompt 里写明「用户说『上面』指的是已配置的目标，不要重复询问」。
+
+**8. 切片未赋值，截断完全失效**
+
+```python
+if len(hist) > MAX_HISTORY:
+    hist[-MAX_HISTORY:]        # 返回值被丢弃
+```
+
+实测：30 条执行后仍是 30 条。修复：`hist = hist[-MAX_HISTORY:]`。
+
+**9. 异常后仍然写入 assistant**
+
+```python
+except ...:
+    st.session_state["chat_history"].pop()     # 撤掉 user
+st.session_state["chat_history"].append({"role": "assistant", ...})   # 异常时也执行
+```
+
+结果：历史末尾留下一条孤立的 assistant（内容残缺）。修复：改用 `try / except / else`，append 只在 `else` 分支执行。
+
+**10. `except AIServiceError` 是死代码**
+
+`AIServiceError` 只在 `pipeline.parse_and_validate` 里包装，`agent.chat_stream` 抛的是 SDK 原始异常，第一个 except 永远不命中。
+
+修复：保留兜底分支，但把 `except Exception` 的文案改成友好提示，原始堆栈进日志。
+
+### 四、可迁移的规则（今天沉淀下来的）
+
+- **「多 tab 布局禁用 `st.stop()`」**：它终止的是整个脚本，不是当前容器。用 `if / else` 控制区域显示。
+- **「UI 元素的定位行为受容器影响」**：`chat_input` 在主容器固定底部，在 tab 内退化为普通元素。跨容器复用必须实测。
+- **「Streamlit 只重跑主脚本，不重载 import 的模块」**：改 `ai/`、`utils/` 下的文件后必须重启服务。
+- **「一个变量不能同时表示容器和内容」**：`box`（画布）与 `buf`（文本）必须分开。
+- **「注入要分两层」**：工具需要的数据走 `ToolRuntime.context`，模型需要知道的走 `system_prompt`。只做前者，模型就会反问。
+- **「模型没有界面感知」**：用户说“上面”“刚才那个”，模型无法解析，prompt 必须显式解释这些指代。
+- **「切片是有返回值的表达式」**：`lst[-n:]` 不修改原列表，必须赋值。
+- **「成功路径与失败路径必须分开」**：`try / except / else` 的 `else` 只在无异常时执行，比在 try 之后无条件写更安全。
+
+### 五、今天产出的面试素材
+
+- **「怎么让模型知道用户已经配置的信息」**：分两层——工具需要的数据通过 `ToolRuntime.context` 注入（不进 prompt、不耗 token），模型需要知道的写进 `system_prompt`。只做前者，模型会因为“信息不足”反复追问；只做后者，工具拿不到数据。**两层都要。**
+- **「Streamlit 的运行模型如何影响交互设计」**：每次交互重跑整个脚本、页面全量重绘、被 import 的模块不重新加载。这三点直接决定了「状态放 `session_state`」「副作用绑定按钮」「改模块要重启」三个约束。
+- **「多轮对话的成本」**：第 n 轮要重发前面所有消息，累计 token 约 O(n²)。10 轮闲聊的输入量约等于 100 条消息。所以必须有 `MAX_HISTORY` 截断，且截断后要保证首条是 `user`（否则模型看到的第一条是“助手说的话”，缺少对应的提问）。
+- **「为什么需要 pending 机制」**：UI 元素的位置由代码执行顺序决定，而“处理输入”必须排在“输入框”之后才能立即显示结果。把输入暂存到 `session_state` 再 rerun，可以让输入框永远最后执行，从而固定在底部。
