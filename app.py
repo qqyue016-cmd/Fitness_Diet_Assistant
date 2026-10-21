@@ -15,7 +15,7 @@ GOAL_LABELS = {"muscle_gain": "增肌", "fat_loss": "减脂", "maintain": "维�
 
 st.set_page_config(page_title='Fitness_Diet_Assistant', page_icon='🥘', layout='wide')
 st.title(body='健身饮食助手', text_alignment='center')
-tab1, tab2, tab3 = st.tabs(["我的计划", "今日记录", "问问AI"])
+tab1, tab2= st.tabs(["我的计划", "今日记录"])
 
 # 侧边栏，存放用户画像
 with st.sidebar:
@@ -38,6 +38,9 @@ with st.sidebar:
     if st.button("生成计划", width="stretch"):
         st.session_state["plan"] = service.build_plan(gender, weight, height, age, activity, goal)
         st.session_state["goal_label"] = GOAL_LABELS[goal]
+    
+    # app.py 里，放在显眼位置（比如 tabs 之前）
+    st.page_link("pages/1_AI_Mode.py", label="问问 AI 助手", icon="💬")
 
     # 选项卡1：我的计划
 with tab1:
@@ -205,65 +208,3 @@ with tab2:
             c[3].write(f"{d['fat_g']:.0f}")
             c[4].write(f"{d['carb_g']:.0f}")
 
-# 选项卡3：问问AI
-MAX_HISTORY = 20
-with tab3:
-    if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = []
-
-    hist = st.session_state["chat_history"]
-    if len(hist) > MAX_HISTORY:
-        hist = hist[-MAX_HISTORY:]
-    while hist and hist[0]["role"] != "user":
-        hist.pop(0)
-    st.session_state["chat_history"] = hist
-
-    plan = st.session_state.get("plan")
-    if plan is None:
-        st.info('请先在左侧生成计划，否则AI无法获取建议')
-    else:
-        # 渲染聊天历史
-        if not st.session_state["chat_history"]:
-            st.chat_message("assistant").write("问我任何关于食物营养、今日摄入的问题")
-
-        for m in st.session_state["chat_history"]:
-            st.chat_message(m["role"]).write(m["content"])
-
-        # ② 处理上一轮提交的问题
-        pending = st.session_state.pop("pending_question", None)
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        if pending:
-            st.session_state["chat_history"].append({"role": "user", "content": pending})
-            st.chat_message("user").write(pending)
-
-            with st.chat_message("assistant"):
-                box = st.empty()
-                buf = ""
-
-                try:
-                    for msg in chat_stream(st.session_state["chat_history"],
-                                           plan["target"],
-                                           today,
-                                           st.session_state.get("goal_label", "")):
-                        if msg["type"] == "text":
-                            buf += msg['content']
-                            box.markdown(buf)
-                except AIServiceError:
-                    box.error("AI服务暂时不可用，请稍后重试。")
-                    st.session_state["chat_history"].pop()
-                except Exception as e:
-                    logger.exception("chat_stream failed")  # 日志留完整堆栈
-                    box.error("AI 服务出错了，请稍后重试。")  # 界面只给结论
-                    st.session_state["chat_history"].pop()
-                else:
-                    st.session_state['chat_history'].append({"role": "assistant", "content": buf})
-
-        # ③ 处理本轮用户输入
-        with st.form("ask_form", clear_on_submit=True):
-            c1, c2 = st.columns([6, 1])
-            q = c1.text_input("提问", label_visibility="collapsed", placeholder="问点什么....")
-            if c2.form_submit_button("提交"):
-                if q.strip():
-                    st.session_state["pending_question"] = q.strip()
-                    st.rerun()
