@@ -1,4 +1,12 @@
-from langchain_community.chat_models.tongyi import ChatTongyi
+import os
+from langchain_openai import ChatOpenAI
 
-chat_model = ChatTongyi(model='qwen-plus', temperature=0, max_retries=2, streaming=True)
+chat_model = ChatOpenAI(
+    model="qwen-plus",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    temperature=0,
+    streaming=True,
+    max_retries=2,
+)
 
