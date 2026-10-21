@@ -1,11 +1,12 @@
 # 健身饮食助手 Fitness Diet Assistant
 
-围绕「**每日营养目标 → 实际摄入 → 缺口反馈**」闭环的健身饮食管理工具。支持**一句话自然语言记录**（LLM 解析 + 确定性护栏校验），也保留传统表单录入。
+围绕「**每日营养目标 → 实际摄入 → 缺口反馈**」闭环的健身饮食管理工具。支持**一句话自然语言记录**（LLM 解析 + 确定性护栏校验）、**AI 对话助手**（查营养、算缺口、直接帮记），也保留传统表单录入。
 
 ## 功能
 
 - **个性化营养计划**：基于 Mifflin-St Jeor 公式计算 BMR / TDEE，按目标（增肌 / 减脂 / 维持）自动调整每日热量与三大营养素分配
 - **自然语言记录**：一句话描述饮食 → LLM 解析为结构化数据 → 护栏做库内匹配与范围校验 → 分级结果经用户确认后写库
+- **AI 对话助手**：支持多轮对话，流式输出；模型自主选择工具完成「查食物营养 / 查当日摄入与缺口 / 写入记录 / 撤销记录」
 - **手动记录**：按日期选择食物 + 克数，支持删除回退
 - **缺口分析**：实时计算「已摄入 vs 目标」差值，正数为可摄入余量、负数为超出
 - **食物库**：内置 104 条常见食物的营养数据（每 100g 的热量 / 蛋白质 / 脂肪 / 碳水）
@@ -14,14 +15,14 @@
 
 Python 3 · SQLite · Streamlit · PyYAML · pytest
 
-**AI 部分**：LangChain（LCEL）· 通义千问（阿里百炼 DashScope，`qwen-plus`）
+**AI 部分**：LangChain / LangGraph（`create_agent` 工具编排）· `langchain-openai` 接入通义千问（阿里百炼 OpenAI 兼容模式，`qwen-plus`）
 
 ## 项目架构
 
 分层设计，依赖单向向下：
 
 ```
-app.py  (UI · Streamlit)
+app.py / pages/*.py  (UI · Streamlit)
    │
    ├────────────────┐
    ▼                ▼
@@ -38,7 +39,7 @@ db.py  ·  calc.py ──┘
 
 | 层 | 文件 | 职责 |
 |---|---|---|
-| UI | `app.py` | 页面渲染、交互、会话状态 |
+| UI | `app.py` / `pages/*.py` | 页面渲染、交互、会话状态（多页面：主页 + AI 助手） |
 | AI | `ai/` | 自然语言解析、确定性护栏、链路编排 |
 | 服务 | `service.py` | 组合数据与计算，输出结构化结果 |
 | 数据 | `db.py` | SQLite 读写、日期规范化 |
@@ -50,10 +51,23 @@ db.py  ·  calc.py ──┘
 
 | 文件 | 职责 |
 |---|---|
-| `client.py` | LLM 客户端（`ChatTongyi`，`qwen-plus`，`temperature=0`） |
+| `client.py` | LLM 客户端（`ChatOpenAI` 兼容模式，`qwen-plus`，`streaming=True`） |
 | `parser.py` | 口语 → 结构化 JSON（LCEL 管道：Prompt → Model → JsonOutputParser） |
 | `guard.py` | 确定性护栏：库内匹配（精确 → 模糊 → 歧义）+ 克数校验 |
 | `pipeline.py` | 串联 `parser → guard`，对 UI 暴露单一入口 |
+| `tools.py` | 6 个工具（4 只读 + 2 写）+ `UserCtx` 上下文（`ToolRuntime` 注入） |
+| `agent.py` | `create_agent` 构建 + `chat_stream` 流式事件流（text / tool / tool_result） |
+
+**工具清单**：
+
+| 工具 | 参数 | 用途 |
+|---|---|---|
+| `search_foods_tool` | `keyword` | 名称不完整时模糊搜索 |
+| `query_food_tool` | `name` | 名称确定时精确查询 |
+| `today_report` | 无 | 今天的摄入与缺口（含明细 id） |
+| `report_by_date` | `date` | 指定日期 |
+| `add_meal` | `food`, `grams` | 写入记录（内部复用护栏 + 幂等检查） |
+| `delete_meal` | `record_id` | 撤销记录（id 必须来自查询结果） |
 
 ## 快速开始
 
@@ -71,7 +85,9 @@ streamlit run app.py
 
 ```
 Fitness_Diet_Assistant/
-├── app.py                  # Streamlit 应用入口（UI 层）
+├── app.py                  # Streamlit 应用入口（我的计划 / 今日记录）
+├── pages/
+│   └── 1_AI_Mode.py        # AI 对话助手（独立页面）
 ├── service.py              # 业务编排层
 ├── db.py                   # 数据访问层（SQLite）
 ├── calc.py                 # 计算层（纯函数）
@@ -79,7 +95,9 @@ Fitness_Diet_Assistant/
 │   ├── client.py           # LLM 客户端
 │   ├── parser.py           # 口语 → 结构化
 │   ├── guard.py            # 确定性护栏
-│   └── pipeline.py         # parser → guard 编排
+│   ├── pipeline.py         # parser → guard 编排
+│   ├── tools.py            # 工具定义 + UserCtx 上下文
+│   └── agent.py            # Agent 构建 + 流式事件流
 ├── config/
 │   ├── SQLite.yaml         # 数据库路径与表名
 │   ├── calc.yaml           # 营养计算系数
@@ -107,12 +125,13 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-共 **64 条用例**，覆盖四个层面：
+共 **72 条用例**，覆盖五个层面：
 
-- `test_calc.py`（20）：计算公式的正常值与边界值（如碳水的负值保护）
+- `test_calc.py`（24）：计算公式的正常值与边界值（如碳水的负值保护）
 - `test_db.py`（22）：增删查、日期规范化、越界输入校验
 - `test_service.py`（6）：服务层编排结果的结构与字段完整性
-- `test_guard.py`（12）：护栏的分级匹配、边界输入、规范名替换
+- `test_guard.py`（13）：护栏的分级匹配、边界输入、规范名替换
+- `test_tools.py`（7）：Agent 工具的写入前置校验、幂等、删除与回显字段
 
 护栏的测试经过**变异测试**验证：故意在实现中植入缺陷，确认对应用例会失败——确保测试本身是有效的，而非摆设。
 
@@ -125,6 +144,8 @@ pytest
 5. **模型只负责转录，代码负责校验**。prompt 中明确「不要判断数值是否合理，只按原话转录」，所有权值与存在性判断都交给 `guard.py`——模型没有数据源的访问权，指望它在 prompt 里"输出库里的名字"是不可能实现的。
 6. **护栏输出分级结果**。`ok` / `ambiguous` / `not_found` / `invalid` 四级，把"这条能不能写库"翻译成用户可操作的四种决策，任何不确定的状态都**不静默写入**。
 7. **写操作必须由动作触发**。Streamlit 的 rerun 模型下，任何副作用（写库、调 API）都不能放在渲染路径上，否则每次交互都会重放一遍。
+8. **Agent 的写操作复用护栏，不裸调 DAO**。`add_meal` 内部依次判断「分配是否歧义 → 食物是否存在 → 克数是否合法 → 是否重复」，任一项不通过都返回说明字符串而非抛异常；`delete_meal` 的 `record_id` 必须来自查询结果，禁止模型编造。
+9. **事实由代码提供，模型只做理解与调度**。当前日期、用户目标、库内食物都通过 `ToolRuntime.context` 或工具查询获得，不依赖模型记忆；prompt 只负责约束行为，不承担事实存储。
 
 ## 已知局限
 
@@ -135,9 +156,9 @@ pytest
 
 | 版本 | 状态 | 主要内容 |
 |---|---|---|
-| **V1** | 已完成 | 确定性内核：食物库 · 营养计算 · 摄入记录 · 缺口分析 · Streamlit · 52 条单测 |
-| **V2** | 进行中 | 已完成：自然语言解析 · 确定性护栏 · 分级确认 UI；待做：Tool Calling · 营养知识 RAG · 评测脚本 |
+| **V1** | 已完成 | 确定性内核：食物库 · 营养计算 · 摄入记录 · 缺口分析 · Streamlit |
+| **V2** | 进行中 | 已完成：自然语言解析 · 确定性护栏 · 分级确认 UI · Tool Calling（6 个工具）· 流式多轮对话 · 对话式写库 · 72 条单测<br>待做：营养知识 RAG · 评测脚本 |
 | V1.5 | 待开始 | FastAPI + Pydantic 校验 + MySQL + Redis + 认证 |
-| V3 | 待开始 | 对话流 + 结构化卡片 · 多步 Agent（LangGraph） |
+| V3 | 待开始 | RAG 知识问答（引用溯源 + Rerank）· 多步编排（LangGraph） |
 
 设计思路：先用确定性代码把领域逻辑固化好，再让 LLM 承担调度层——比直接堆 prompt 更可控、可测试。
