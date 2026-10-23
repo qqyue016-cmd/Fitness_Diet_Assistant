@@ -1,0 +1,9 @@
+collection_name: nutrition_kb
+persist_directory: data/chroma
+data_path: data/knowledge
+
+# 检索返回条数
+k: 3
+
+# 距离度量（仅建库时生效，改后需删库重建）
+collection_metadata: {"hnsw:space": "cosine"}
