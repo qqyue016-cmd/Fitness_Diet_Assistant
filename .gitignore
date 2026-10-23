@@ -5,3 +5,9 @@ __pycache__/
 data/*.db
 logs/*.log
 .env
+
+# 向量库：可从 data/knowledge/*.csv 重建，不进版本库
+data/chroma/
+
+# 本地实验数据，不公开
+实验数据.md
