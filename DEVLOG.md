@@ -1822,3 +1822,162 @@ Chroma 要求 dict，正确写法 `collection_metadata: {"hnsw:space": "cosine"}
 - **「为什么暂时不做 rerank」**：基线 R@3 已 96.7%，35 个 chunk 的规模下向量检索接近上限。加 rerank 要多一次模型调用 + 约 200ms 延迟，而提升空间只有 1 题。**先记录「测过但收益不足」，等语料扩到几百篇再重新评估。**
 
 - **「你遇到过最难查的 bug」**：正则里的问号写成了全角 `？`。`re.split` 不匹配时不报错，只是把整段文本原样返回，所以每篇只切出 1 个 chunk 而不是 4 个。建库成功、检索也有返回，看起来一切正常。最后靠「chunk 数应该是 35 而不是 9」这个断言才发现。**不报错的 bug 比报错的危险得多。**
+
+---
+
+## 2026-10-24 ~ 25 ｜ V2 第八块：RAG 接入 Agent 与引用溯源
+
+### 一、本次目标
+
+把已有的知识库检索能力接进 agent，让「为什么减脂要控油」这类问题能基于材料回答并给出出处。核心问题是**架构定位**：RAG 的上下文该进提示词，还是当工具用？
+
+### 二、完成的事
+
+**1. `rag/rag_service.py`：三个函数**
+
+```python
+search(query)          → list[dict]   # 检索，返回 chunk_id / content / doc_title / section / source
+build_context(hits)    → str          # 拼成 [1] 【文档 > 小节】… 来源：… 的编号文本
+parse_sources(ctx)     → list[dict]   # 反解析，取出 {idx, doc, section, source}
+search_nutrition_knowledge(query)     # 前两者的组合入口
+```
+
+**2. 注册为第 7 个工具**
+
+`ai/tools.py` 末尾新增 `@tool search_knowledge`，内部调 `search_nutrition_knowledge`。RAG 层不依赖 LangChain 装饰器，由 `ai/` 层负责适配——保持 `rag/` 与框架解耦。
+
+**3. system_prompt 新增路由规则（第 11 条）**
+
+```
+11. 涉及营养学原理、机制、通用建议时，调用 search_knowledge，回答必须标注出处。
+    用户自身的目标值、已摄入、缺口等具体数据，必须走数据类工具，
+    不得用知识库中的通用数值替代。
+```
+
+第二句是关键：语料里的 `05_BMR与TDEE` 有公式，不加这条约束，用户问「我每天该吃多少」，模型可能用知识库公式自己算，而不是调 `today_report`。
+
+**4. 工具路由实测（三条全对）**
+
+| 问题 | 调用工具 | 判断 |
+|---|---|---|
+| 为什么减脂期要控制脂肪摄入 | `search_knowledge` | 知识类 → RAG ✅ |
+| 我今天还剩多少热量 | `today_report` | 用户数据 → 数据工具 ✅（没用知识库公式自己算） |
+| 鸡胸肉多少卡 | `search_foods_tool` | 食物数据 → 食物库 ✅ |
+
+**5. UI 展示「参考资料」**
+
+- `tool` 事件按工具名显示不同提示（📚 查询营养知识库 / 📊 查询今日摄入 / 🔍 搜索食物库）
+- `tool_result` 中 `name == search_knowledge` 的文本被收集，回答结束后用 `parse_sources` 解析成列表，放进 `st.expander`
+- `sources` 一并存进 `history` 的 assistant 消息，**下一轮 rerun 重绘历史时参考资料仍在**
+
+**6. 契约测试（`tests/test_rag_service.py`）**
+
+```python
+def test_parse_sources_roundtrip():
+    hits = search("减脂期蛋白质吃多少")
+    parsed = parse_sources(build_context(hits))
+    assert len(parsed) == len(hits)
+    assert parsed[0]["doc"] and parsed[0]["source"]
+```
+
+这条测试在开发过程中**连续抓到 3 个 bug**，详见下一节。
+
+### 三、遇到的问题与解决
+
+**问题 1：`get_retriever()` 返回的是检索器，不是结果**
+
+```python
+vector.get_retriever(query)          # TypeError: takes 1 positional argument but 2 were given
+```
+
+`get_retriever()` 不接受参数，返回一个 retriever 对象。正确是两步：
+
+```python
+vector.get_retriever().invoke(query)
+```
+
+但改完又撞第二个问题：返回的是 `list[Document]`，而代码用 `hit['metadata']` —— `TypeError: 'Document' object is not subscriptable`。Document 是对象，要用 `hit.page_content` / `hit.metadata`。
+
+**问题 2：`tool_result` 事件没有 `name` 字段**
+
+UI 里写 `if ev["name"] == "search_knowledge"` → `KeyError: 'name'`。实测事件结构：
+
+```
+tool         | keys = ['type', 'name', 'id']
+tool_result  | keys = ['type', 'content', 'id']   ← 没有 name
+```
+
+解决：在 `chat_stream` 里维护 `name_by_id` 映射（`tool` 事件时记录 id→name，`tools` 节点产出时反查），让 `tool_result` 带上 name。**配对逻辑下沉到产生事件的一层，UI 不必关心 id。**
+
+**问题 3：用 `box.caption()` 显示工具提示会闪**
+
+`box` 是正文画布（`box.markdown(buf)`），写 caption 会覆盖已输出的文字，下一次 `markdown(buf)` 又盖回来——提示一闪而过。改用一个独立的 `hint = st.empty()`，循环结束 `hint.empty()`。
+
+**问题 4：`parse_sources(source)` 传的是 list**
+
+函数签名要 `str`，传 `list[str]` → `AttributeError: 'list' object has no attribute 'splitlines'`。改成 `parse_sources("\n".join(source))`。
+
+**问题 5（最关键）：`build_context` 与 `parse_sources` 的格式对不上**
+
+即使传对类型，`parse_sources` 仍返回 `[]`。根因是两处细节：
+
+| | `build_context` 实际产出 | 解析逻辑期待 |
+|---|---|---|
+| 编号后 | `[1].` 有**点号** | `[1] ` 直接接 `【` |
+| 出处标签 | `metadata:` | `来源：` |
+
+`re.match(r"\[(\d+)\]\s*【(.+?)】", "[1]. 【…】")` → `None`，静默返回空列表，**界面表现为「参考资料」不显示**。
+
+解决：`build_context` 改为 `f"[{i}] {hit['content']}\n来源：{hit['source']}\n\n"`，去掉点号、`metadata:` 换 `来源：`。这个改动对模型也更友好——`metadata` 是给开发者看的词。
+
+**问题 6：正则捕获组少写一对括号（改了三次才成）**
+
+```python
+r"\[(\d+)\]\s*【.+?】"     # 只有 1 个捕获组 → m.group(2) → IndexError: no such group
+r"\[(\d+)\]\s*【(.+?)】"   # 2 个 ✅
+```
+
+判据：**`group(n)` 的 n 不能超过正则里左括号的数量**。`【.+?】` 外面的括号决定它是否成为一个组。最终改用 `(.+)` 而非 `(.+?)`——`】` 是明确边界，不需要非贪婪，少一个问号也少一处看花的机会。
+
+**问题 7：`import ai.tools` 耗时 3.76 秒**
+
+`rag_service.py` 模块级执行 `vector = VectorStoreService()`，而 `ai/tools.py` import 它——于是**import 阶段就建立了 Chroma 连接**。实测 pytest 从 2.17s 涨到 4.45s；若 Chroma 目录损坏，连 import 都会失败。
+
+未修（V2 可接受），建议懒加载：
+
+```python
+_vector = None
+def _get_vector():
+    global _vector
+    if _vector is None:
+        _vector = VectorStoreService()
+    return _vector
+```
+
+### 四、可迁移的规则
+
+- **「结构化数据与文本格式的往返必须有契约测试」**：`build_context` 生成文本，`parse_sources` 反解析。两者放在同一文件只是**必要条件**——格式仍然可以对不上（这次就是点号和标签两处偏差）。真正的保障是 `assert len(parse_sources(build_context(hits))) == len(hits)`，一条断言就能覆盖全部格式细节。
+
+- **「事件契约要一次定型」**：`tool_result` 少一个 `name` 字段，UI 就多一层 id 配对逻辑。**产生事件的一方应该把消费方需要的信息补齐**，而不是让每个消费方各自反查。
+
+- **「UI 的占位符按用途分开」**：`st.empty()` 是画布，一个画布只能承载一个持续更新的内容。正文、提示、错误各用各的占位符，混用必然互相覆盖。
+
+- **「捕获组数量决定 group(n) 的上限」**：写 `m.group(2)` 之前先数左括号。`(.+?)` 与 `(.+)` 在明确边界下等价，后者更不易看错。
+
+- **「RAG 上下文作为工具返回值，而不是提示词」**：检索结果是动态材料，不是静态规则。塞进 system_prompt 会强制每轮携带、挤占对话空间，还会让模型混淆「必须遵守的约束」与「可引用的参考」。**知识的生命周期是一次调用，规则的生命周期是整个会话。**
+
+- **「引用出处不要指望模型标注」**：prompt 里写了「回答必须标注 `[1]`」并给了示例，实测模型一次都没写。引用不是模型的自然行为——它倾向于消化材料后用自己话讲。改为从工具返回值反解析、由 UI 独立展示，确定性 100%，信息还更完整（3 条全显示 vs 模型引用几条算几条）。
+
+- **「模块级初始化的副作用要算进成本」**：一行 `vector = VectorStoreService()` 让 `import ai.tools` 从 0 秒变成 3.76 秒，连带 73 条测试慢了 2 倍。**依赖外部资源（文件、连接、网络）的初始化都该延迟到首次使用。**
+
+### 五、本次产出的面试素材
+
+- **「RAG 在你的架构里是提示词还是工具」**：是工具。用户问「为什么减脂要控油」时，agent 调 `search_knowledge`，工具内部完成检索和上下文拼装，返回带编号与出处的材料，模型基于它作答。**不塞提示词的原因**：检索结果动态变化、长度不可控（3 块约 1100 字），塞进去会强制每轮携带；而且规则和材料混在一起，模型分不清哪些是必须遵守的、哪些是仅供参考的。
+
+- **「怎么保证回答有出处」**：不靠模型自觉。实测在 prompt 里明确要求标注 `[1]`，模型一次都没写。所以改成从工具返回值反解析 `parse_sources`，UI 用折叠区展示「参考资料」——哪篇文档、哪个小节、原始书目。**出处是事实，应该由代码提供，不该指望模型如实转述。**
+
+- **「RAG 和工具调用怎么分工」**：数据类问题走 SQL（食物库、摄入记录、目标缺口），知识类问题走向量检索（营养原理、机制、通用建议）。prompt 里明确禁止用知识库的通用数值替代用户的实际数据——否则用户问「我每天该吃多少」，模型会拿语料里的 BMR 公式自己算，而不是查他的实际记录。
+
+- **「这个模块你怎么保证不出错」**：`build_context` 和 `parse_sources` 是文本格式的两端，写了契约测试——用 30 题评测集里的真实查询，断言「解析出的条数 = 检索返回的条数」且首条出处非空。这条测试在开发中连续抓到 3 个 bug：类型传错、格式带点号、正则少捕获组。**没有它，这些问题都要等到打开浏览器才发现「参考资料」是空的。**
+
+- **「你踩过的坑里最有代表性的」**：`tool_result` 事件缺 `name` 字段，UI 里 `ev["name"]` 直接 KeyError，异常又被 `except Exception` 吞掉，界面只显示「AI 服务出错了」——看起来像服务故障，实际是事件契约不完整。**异常兜底会让根因隐藏，所以日志必须打完整堆栈，而事件结构应该在产生方一次定型。**
