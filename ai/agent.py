@@ -1,9 +1,9 @@
 from langchain.agents import create_agent
 
 from ai.client import chat_model
-from ai.tools import UserCtx, today_report, report_by_date, search_foods_tool, query_food_tool,add_meal, delete_meal
+from ai.tools import UserCtx, today_report, report_by_date, search_foods_tool, query_food_tool,add_meal, delete_meal,search_knowledge
 
-TOOLS = [today_report, report_by_date, search_foods_tool, query_food_tool, add_meal, delete_meal]
+TOOLS = [today_report, report_by_date, search_foods_tool, query_food_tool, add_meal, delete_meal,search_knowledge]
 
 SYSTEM_PROMPT =  """你是健身饮食助手，帮用户查询与记录饮食。
 
@@ -33,6 +33,9 @@ SYSTEM_PROMPT =  """你是健身饮食助手，帮用户查询与记录饮食。
 8. 写入记录前确认：食物唯一命中、克数已知、用户明确要求记录。任一不确定先问。
 9. 删除记录前必须先调 today_report 查出当天明细并取得 id；多条同名记录必须让用户确认。
 10. 中文回答，简洁直接，一定不要提及内部 id。
+11. 涉及营养学原理、机制、通用建议（如「为什么减脂要控油」「蛋白怎么分配」）时，
+    调用 search_nutrition_knowledge 检索知识库，回答必须标注出处。
+    用户自身的目标值、已摄入、缺口等具体数据，仍走数据类工具，不得用知识库内容替代。
 """
 
 def _make_agent(today: str, target: dict, goal: str):
@@ -53,6 +56,7 @@ def chat_stream(messages: list[dict], target: dict, today: str, goal: str = ""):
     {"type": "tool_result", "content": "[{...}]", "id": "call_xxx"}
     """
     agent = _make_agent(today, target, goal)
+    name_by_id = {}
 
     for chunk, meta in agent.stream(
             {"messages": messages},
@@ -69,13 +73,15 @@ def chat_stream(messages: list[dict], target: dict, today: str, goal: str = ""):
             # 工具调用决定（分片到达，只有首片带 name）
             for c in (getattr(chunk, "tool_call_chunks", None) or []):
                 if c.get("name"):
+                    name_by_id[c.get("id")] = c["name"]
                     yield {"type": "tool", "name": c["name"], "id": c.get("id")}
 
         elif node == "tools":
+            tid = getattr(chunk, "tool_call_id", None)
             yield {
                 "type": "tool_result",
                 "content": chunk.content,
-                "id": getattr(chunk, "tool_call_id", None),
+                "name": name_by_id.get(tid, ""), "id": tid,
             }
 
 

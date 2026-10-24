@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from langchain.tools import tool, ToolRuntime
 from service import build_daily_report
 from ai.guard import match_food,MAX_GRAMS
+from rag.rag_service import search_nutrition_knowledge
 import json
 
 
@@ -100,3 +101,11 @@ def delete_meal(record_id: int, runtime: ToolRuntime[UserCtx]) -> str:
     name = f"{target['food']} {target['grams']:g}g" if target else "该记录"
     return (f"已删除: {name}，今日还剩{len(report['items'])}条记录。"
             f"已摄入{report['total']['kcal']:.0f}kcal。")
+
+@tool
+def search_knowledge(query: str):
+    '''
+    涉及营养学原理、机制、通用建议（如「为什么减脂要控油」「蛋白怎么分配」）时，
+    调用 search_nutrition_knowledge 检索知识库，返回最相关的段落。
+    '''
+    return search_nutrition_knowledge(query)
