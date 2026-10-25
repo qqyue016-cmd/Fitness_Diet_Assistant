@@ -22,7 +22,13 @@ def load_chroma_config(config_path: str=get_abs_path('config/chroma.yaml'),encod
     with open(config_path,'r',encoding=encoding) as f:
         return yaml.load(f,Loader=yaml.FullLoader)
 
+def load_evals_config(config_path: str=get_abs_path('config/evals.yaml'),encoding: str='utf-8'):
+    with open(config_path,'r',encoding=encoding) as f:
+        return yaml.load(f,Loader=yaml.FullLoader)
+
+
 config_sqlite = load_sqlite_config()
 config_foods_data = load_foods_config()
 config_calc = load_calc_config()
 config_chroma = load_chroma_config()
+config_evals = load_evals_config()

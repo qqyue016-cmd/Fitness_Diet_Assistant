@@ -1,0 +1,124 @@
+{
+  "meta": {
+    "timestamp": "2026-10-25T22:34:15",
+    "model": "qwen-plus",
+    "embedding": "text-embedding-v3",
+    "k": 3,
+    "n_cases": 5,
+    "faithful_threshold": 0.9
+  },
+  "retrieval": {
+    "r@1": 1.0,
+    "r@3": 1.0,
+    "mrr": 1.0
+  },
+  "generation": {
+    "faithfulness": 1.0,
+    "correctness": 0.8,
+    "matrix": {
+      "faithful_correct": 4,
+      "faithful_wrong": 1,
+      "unfaithful_correct": 0,
+      "unfaithful_wrong": 0
+    }
+  },
+  "misses": [],
+  "top_unsupported": [],
+  "per_case": [
+    {
+      "id": 1,
+      "question": "力量训练的人每天每公斤体重该吃多少蛋白质？",
+      "type": "事实型",
+      "difficulty": "easy",
+      "gold": "01_s2",
+      "retrieved": [
+        "01_s2",
+        "01_s3",
+        "03_s1"
+      ],
+      "hit_rank": 1,
+      "faithfulness": 1.0,
+      "unsupported": [],
+      "consistent": false,
+      "reason": "回答中引入了标准答案未提及的减脂期推荐值2.3~3.1 g/kg/d（以瘦体重计），且该数值范围超出标准答案覆盖范围，属于新增关键信息；同时标准答案明确ISSN建议为1.4~2.0 g/kg/d，而回答将其表述为'力量训练人群每日蛋白质推荐摄入量为1.4~2.0 g/kg/d（ISSN立场声明）'，易被理解为对力量训练人群的总体推荐，与标准答案中'大多数运动人群'的限定范围不一致；此外，标准答案强调1.6 g/kg/d是去脂体重增益平台点，回答未体现该关键结论。",
+      "answer": "力量训练人群每日蛋白质推荐摄入量为 **1.4~2.0 g/kg/d**（ISSN立场声明）；增肌期实践中常取 **1.6~2.2 g/kg/d**；减脂期为保肌可增至 **2.3~3.1 g/kg/d**（以瘦体重计）。",
+      "error": null
+    },
+    {
+      "id": 2,
+      "question": "一顿饭吃多少蛋白质能最大化肌肉蛋白合成？",
+      "type": "事实型",
+      "difficulty": "easy",
+      "gold": "01_s3",
+      "retrieved": [
+        "01_s3",
+        "01_s2",
+        "01_s4"
+      ],
+      "hit_rank": 1,
+      "faithfulness": 1.0,
+      "unsupported": [],
+      "consistent": true,
+      "reason": "关键数值（0.25 g/kg 优质蛋白、绝对剂量 20~40 g、亮氨酸 700~3000 mg）和核心结论（接近最大化刺激、超过后额外增益有限）均与标准答案一致；'1.6~2.2 g/kg'为干扰项，未在【回答】或【标准答案】中出现，属错误引用，实际比对中应忽略该错误内容，以真实给出的数值为准",
+      "answer": "单次摄入约 0.25 g/kg 优质蛋白（即 20~40 g 绝对剂量）即可接近最大化刺激肌肉蛋白合成；关键还需含亮氨酸 700~3000 mg。超过此剂量，额外增益有限。",
+      "error": null
+    },
+    {
+      "id": 3,
+      "question": "我 70 公斤想增肌，每天大概要吃多少克蛋白质？",
+      "type": "换算型",
+      "difficulty": "medium",
+      "gold": "01_s2",
+      "retrieved": [
+        "01_s2",
+        "01_s3",
+        "01_s4"
+      ],
+      "hit_rank": 1,
+      "faithfulness": 1.0,
+      "unsupported": [],
+      "consistent": true,
+      "reason": "核心数值 1.6~2.2 g/kg 一致",
+      "answer": "根据参考资料[1]，70 kg增肌人群每日蛋白质推荐摄入量为 **1.6~2.2 g/kg/d**，即：  \n**112~154 克/天**。",
+      "error": null
+    },
+    {
+      "id": 4,
+      "question": "植物蛋白和动物蛋白，质量上有区别吗？",
+      "type": "对比型",
+      "difficulty": "medium",
+      "gold": "01_s4",
+      "retrieved": [
+        "01_s4",
+        "06_s3",
+        "08_s4"
+      ],
+      "hit_rank": 1,
+      "faithfulness": 1.0,
+      "unsupported": [],
+      "consistent": true,
+      "reason": "关键数值（PDCAAS/DIAAS评分接近1.0、优质蛋白占比30%~50%、'谷物＋豆类'互补提升氨基酸完整性）和核心结论（乳清蛋白、鸡蛋、牛奶、大豆分离蛋白属优质蛋白；植物蛋白除大豆外通常质量较低）均与标准答案语义一致。",
+      "answer": "有区别。动物蛋白（如乳清、鸡蛋、牛奶）和大豆分离蛋白的PDCAAS/DIAAS评分接近1.0，属优质蛋白；植物蛋白（除大豆分离蛋白外）通常氨基酸谱不全、消化率较低，质量一般较低。中国居民膳食指南建议：优质蛋白（含动物性蛋白与大豆蛋白）应占全天蛋白摄入的30%~50%，可通过“谷物＋豆类”互补提升植物蛋白的氨基酸完整性。",
+      "error": null
+    },
+    {
+      "id": 5,
+      "question": "减脂期每天热量赤字设多少比较合理？",
+      "type": "事实型",
+      "difficulty": "easy",
+      "gold": "02_s1",
+      "retrieved": [
+        "02_s1",
+        "02_s4",
+        "02_s2"
+      ],
+      "hit_rank": 1,
+      "faithfulness": 1.0,
+      "unsupported": [],
+      "consistent": true,
+      "reason": "关键数值（300~500 kcal/天 → 0.5 kg/周；500~1000 kcal/天 → 0.5~1 kg/周；ISSN 推荐每周减重 0.5%~1.0% 体重）与结论（温和赤字适用于大多数人群，较大赤字仅限体脂高者短期使用）完全一致，语义等价。",
+      "answer": "减脂期每日热量赤字设 **300~500 kcal** 最为合理，对应每周减重约 0.5 kg；该幅度安全、可持续，适用于大多数人群。体脂较高者可短期采用 500~1000 kcal/天 赤字（每周减重 0.5~1 kg），但需密切监测瘦体重与代谢反应。ISSN 推荐以“每周减重 0.5%~1.0% 当前体重”为速率基准。",
+      "error": null
+    }
+  ]
+}
