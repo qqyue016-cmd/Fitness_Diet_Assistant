@@ -1981,3 +1981,139 @@ def _get_vector():
 - **「这个模块你怎么保证不出错」**：`build_context` 和 `parse_sources` 是文本格式的两端，写了契约测试——用 30 题评测集里的真实查询，断言「解析出的条数 = 检索返回的条数」且首条出处非空。这条测试在开发中连续抓到 3 个 bug：类型传错、格式带点号、正则少捕获组。**没有它，这些问题都要等到打开浏览器才发现「参考资料」是空的。**
 
 - **「你踩过的坑里最有代表性的」**：`tool_result` 事件缺 `name` 字段，UI 里 `ev["name"]` 直接 KeyError，异常又被 `except Exception` 吞掉，界面只显示「AI 服务出错了」——看起来像服务故障，实际是事件契约不完整。**异常兜底会让根因隐藏，所以日志必须打完整堆栈，而事件结构应该在产生方一次定型。**
+
+---
+
+## 2026-10-25 ｜ V2 第九块：评测框架（检索层 + 生成层）
+
+### 一、今日目标
+
+把评测从「一次性脚本」固化成可重复执行的工具。要求：**任何一次改动（换切分、调 k、加 rerank）都能立刻知道指标有没有退化**，且结果落盘可跨版本对比。
+
+### 二、完成的事
+
+**1. `evals/` 五个模块**
+
+| 文件 | 职责 |
+|---|---|
+| `dataset.py` | 加载评测集、四项校验、`real_cases()` 校验失败即抛错 |
+| `retrieval_eval.py` | `eval_retrieval(cases)` → R@3 / R@1 / MRR / per_case / misses |
+| `generation_eval.py` | 生成 + 两个 judge（faithfulness / correctness）+ 2×2 矩阵聚合 |
+| `run_eval.py` | 串联两层、打印报告、写 `results/eval_YYYYMMDD_HHMM.json` |
+| `results/` | 每次运行的明细，含 meta（模型 / embedding / k / 阈值） |
+
+**2. 评测集迁入项目**
+
+从桌面复制到 `data/eval_data/eval_set_v1.json`。**评测脚本必须能长期复现**，放在桌面换个环境就失效。
+
+**3. 双层指标首次产出（30 题）**
+
+| 层 | 指标 | 值 |
+|---|---|---|
+| 检索 | R@3 / R@1 / MRR | 96.7% / 90.0% / 0.9333 |
+| 生成 | faithfulness / correctness | **0.96** / **0.70** |
+| 矩阵 | faithful_correct / faithful_wrong / unfaithful_correct / unfaithful_wrong | 19 / 6 / 2 / 3 |
+
+**4. 三个可执行的诊断结论**
+
+① **语料缺口**（faithfulness 的直接产出）：`1g 脂肪 = 9 kcal（资料未提及能量密度）` 出现 **4 次**（id 7/11/16/19）。脂肪篇没写能量密度，而模型每次都补 → 应补进 `09` 篇第一节。
+
+② **`faithful_wrong = 6` 指向新问题**：模型忠实于检索资料，但与标准答案不一致。说明 top-3 里混入的干扰 chunk 会影响模型理解。此前判断「rerank 收益不足」的依据是 R@3 已有 96.7%，但那只衡量「召回到没有」，没衡量「干扰项是否误导」。**这条数据让 rerank 重新具备验证价值。**
+
+③ **correctness 的错题是真错，不是 judge 过严**。抽查 id=1：回答把「力量训练人群推荐量」写成 1.4~2.0（ISSN 对运动人群的建议），而标准答案的主结论是 1.6~2.2，1.4~2.0 只是其中一个引用来源。**数值都对，但主次定位反了**——这正是事实型题目最容易出的错。
+
+### 三、遇到的问题与解决
+
+**问题 1：LLM-as-judge 有强烈的「宽松偏差」（本次最重要的发现）**
+
+同一份回答，只改 judge prompt：
+
+| judge prompt | supported_ratio | 识别出的无据内容 |
+|---|---|---|
+| 原版「判断事实性结论是否有依据」 | **1.00** | 无 |
+| 收紧版「即使结论正确、符合常识，只要资料未明确写出就算 unsupported」 | **0.75** | `1g 脂肪 = 9 kcal（资料未提及能量密度）` |
+
+核验事实：回答含 `1g = 9kcal`，而 context 里 `9 kcal` / `9kcal` / `9千卡` / `能量密度` **全部为 False**。
+
+原因：judge 会判断「这个说法对不对」，而不是「资料里有没有写」。9 kcal/g 是对的，所以放过。
+
+**解决**：prompt 里必须显式声明「正确性 ≠ 有依据」。这条经验适用于任何 faithfulness 评测（RAGAS 的 faithfulness 同样如此），也是官方文档强调「LLM-as-judge 是估计值不是真值、必须人工抽检」的原因。
+
+**问题 2：`per_case = misses = []` —— 同一对象**
+
+`a = b = []` 不是创建两个空列表，是让两个变量指向同一个。往 `per_case` append，`misses` 也会同步多一条。
+
+不报错，但结果里 `misses` 会塞满所有题（包括命中的），看到「未命中 30 题」会误判检索崩了。
+
+**问题 3：`for q, g, i in list1, list2, list3` —— 不报错但语义全错**
+
+这行能跑通，因为它把三个列表当成「三行」迭代。实测（3 题为例）：
+
+```
+期望：q1→g1, q2→g2, q3→g3
+实际：query='q1'  gold='q2'  id='q3'      ← 全错位
+实际：query='g1'  gold='g2'  id='g3'
+```
+
+长度相同时不抛异常。**问题 2 和 3 都属于「不报错但结果错」，只能靠校准锚点（96.7% / 90.0% / 0.9333）发现。**
+
+**问题 4：生成与判分对 `JsonOutputParser` 的需求相反**
+
+```python
+# 生成：要自然语言 → 不加 parser → 取 .content
+chain = prompt | chat_model
+return chain.invoke(...).content
+
+# 判分：要 JSON → 加 parser → 不能再取 .content
+chain = prompt | chat_model | JsonOutputParser()
+return chain.invoke(...)
+```
+
+改前者时把 `.content` 复制到了后者，导致 `AttributeError: 'dict' object has no attribute 'content'`。**判据：链路末尾有没有 `JsonOutputParser`，决定要不要取 `.content`。**
+
+**问题 5：`case["answer"]` 不存在**
+
+评测集字段是 `id / type / difficulty / question / ground_truth / gold_chunk`，`answer` 是模型生成的、在结果里。判分应该传 `case["ground_truth"]`。
+
+**问题 6：`_as_bool` 缺失会导致判分静默反转**
+
+judge 可能返回 `true`（bool）或 `"true"`（字符串）。不规范化的话，`"false"` 在 Python 里是 truthy，会被算成「正确」。
+
+```python
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"true", "是", "yes", "1"}
+```
+
+**问题 7：`eval_retrieval()` 自己取 cases，导致两层数据不一致**
+
+`eval_retrieval()` 内部调 `real_cases()` 取 30 题，而 `eval_generation(cases[:5], retrieval)` 只跑 5 题 → 两层用的不是同一批数据。
+
+改成 `eval_retrieval(cases)`，由调用方统一加载。**这是「函数要不要自己拿数据」的问题：拿数据应该是调用方的职责，否则无法做子集实验。**
+
+### 四、可迁移的规则
+
+- **「LLM-as-judge 默认宽松」**：它会判断「内容对不对」，而不是「资料里有没有」。prompt 必须显式区分这两件事，否则 faithfulness 系统性虚高。而且**必须人工抽检 3~5 题**——judge 不准，后面所有指标都不可信。
+
+- **「评测脚本本身需要被评测」**：`per_case = misses = []` 和 `for x,y,z in list1,list2,list3` 都不报错，只是结果错。唯一的发现手段是**预先确定一个校准锚点**（人工核对过的 96.7% / 90.0% / 0.9333）。没有锚点，你会得到一组看起来合理的假数据。
+
+- **「链式调用的返回值类型决定要不要取 `.content`」**：`prompt | model` 返回 `AIMessage`，`prompt | model | JsonOutputParser()` 返回 `dict`。删掉 parsre 时要记得加 `.content`，加回 parser 时要记得删——这是一对必须同步的动作。
+
+- **「函数不要自己拿数据」**：`eval_retrieval()` 内部读评测集，就无法对子集求值。数据由调用方传入，函数才是纯的、可测的、可组合的。
+
+- **「指标要能指导行动」**：`faithfulness = 0.96` 本身没有行动价值；`1g 脂肪 = 9 kcal 缺失 4 次` 直接告诉你「去补 09 篇第一节」。**聚合指标的用途是定位，不是打分。**
+
+- **「结构化落盘的价值在于跨版本对比」**：`meta` 里必须记录模型 / embedding / k / 阈值，否则两次运行的 JSON 不可比。这是「有数据支撑」的前提——数据不可比，就等于没有数据。
+
+### 五、今天产出的面试素材
+
+- **「你怎么评测 RAG」**：分两层。检索层用 30 题标注集算 R@3 / R@1 / MRR（当前 96.7% / 90.0% / 0.9333）；生成层用 LLM-as-judge 算 faithfulness（回答是否被检索内容支持）和 correctness（是否与标准答案一致），再交叉成 2×2 矩阵。**两层分开测的原因**：召回成功不代表答对——我的数据里就有 6 题「忠实于资料但答案与标准不一致」，那是资料或排序的问题，不是检索没召回。
+
+- **「LLM-as-judge 可靠吗」**：不可靠，默认有宽松偏差。我实测过：同一份回答，原版 prompt 判 `supported_ratio = 1.0`，收紧后判 `0.75` 并精确指出「`1g 脂肪 = 9 kcal` 资料未提及」。差别在于 prompt 有没有声明「即使结论正确、符合常识，只要资料没写就算无据」。**所以 judge 的 prompt 必须像测试用例一样设计，而且必须人工抽检。**
+
+- **「评测发现了什么问题」**：两个。① 语料缺口——「脂肪能量密度 9 kcal/g」在 4 道题里被模型补充，说明语料没写，直接导致我去补那一节；② 6 题 `faithful_wrong` 说明 top-3 里的干扰 chunk 会让模型答偏，这让我重新评估 rerank 的价值——**之前只看 R@3 认为它没用，但 R@3 衡量的是「有没有召回到」，不是「干扰项有没有误导」。**
+
+- **「为什么不用 RAGAS」**：实测 `pip install ragas` 会把 `langchain-openai` 从 1.7.2 降到 1.1.9、`openai` 从 3.35.1 降到 1.109.1，会破坏现有 agent。而且 RAGAS 的 faithfulness 本质是一次 LLM 判断，自己写 20 行就够，还能产出更结构化的 `unsupported_claims`（RAGAS 只给一个分数）。**开源的评测框架解决的是「指标标准化」，不是「指标设计」——先想清楚评什么，再决定用什么工具。**
+
+- **「评测脚本怎么保证自己是对的」**：预先确定校准锚点。三层指标必须与人工核对过的历史数据完全一致（96.7% / 90.0% / 0.9333），对不上就停下查。开发过程中这条规则抓到了两个不报错的 bug：共享列表引用、三个列表并列迭代导致 query 与 gold 错位。
