@@ -6,7 +6,7 @@ from langchain_chroma import Chroma
 from utils.path_tool import get_abs_path
 from utils.config_tool import config_chroma
 from utils.logger_tool import logger
-from ai.client import embedding_model
+from llm.factory import get_embedding_model
 from langchain_core.documents import Document
 
 class VectorStoreService:
@@ -14,7 +14,7 @@ class VectorStoreService:
         self.chroma = Chroma(
             collection_name=config_chroma['collection_name'],
             persist_directory=get_abs_path(config_chroma['persist_directory']),
-            embedding_function=embedding_model,
+            embedding_function=get_embedding_model(),
             collection_metadata=config_chroma['collection_metadata']
         )
 

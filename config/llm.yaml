@@ -1,0 +1,18 @@
+provider:
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+
+chat:
+  default:
+    model: qwen-plus
+    temperature: 0
+    streaming: true
+    max_retries: 2
+  judge:
+    model: qwen-plus
+    temperature: 0
+    streaming: false
+
+embedding:
+  model: text-embedding-v3
+  chunk_size: 10

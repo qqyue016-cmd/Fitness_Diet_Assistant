@@ -1,8 +1,8 @@
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from ai.client import chat_model
 from evals.retrieval_eval import eval_retrieval
+from llm.factory import get_chat_model
 from utils.logger_tool import logger
 
 FAITHFULNESS_PROMPT = """对【回答】中的每个事实性结论，判断【参考资料】中是否有**明确依据**。
@@ -19,7 +19,7 @@ FAITHFULNESS_PROMPT = """对【回答】中的每个事实性结论，判断【�
 {answer}
 
 只输出 JSON，不要解释文字：
-{{"supported_ratio": 0.75, "unsupported_claims": ["1g 脂肪 = 9 kcal（资料未提及能量密度）"]}}
+{{"supported_ratio": 0.75, "unsupported_claims": ["某条与本题无关的示例断言（资料未提及）"]}}
 """
 
 CORRECTNESS_PROMPT = """判断【回答】与【标准答案】在语义上是否一致。不要求措辞相同，只要关键数值与结论一致即可。
@@ -47,23 +47,25 @@ GENERATE_PROMPT = """你是健身饮食助手。请根据以下参考资料回�
 def generate_answer(question: str, context: str) -> str:
     """基于上下文生成回答（1 次 LLM 调用）。"""
     prompt = ChatPromptTemplate.from_template(GENERATE_PROMPT)
-    chain = prompt | chat_model
+    chain = prompt | get_chat_model()
     return chain.invoke({"context": context, "question": question}).content
 
 
+# 事实性判断
 def judge_faithfulness(context: str, answer: str) -> dict:
     """返回 {"supported_ratio": float, "unsupported_claims": list[str]}。"""
     prompt = ChatPromptTemplate.from_template(FAITHFULNESS_PROMPT)
     output_parser = JsonOutputParser()
-    chain = prompt | chat_model | output_parser
+    chain = prompt | get_chat_model("judge") | output_parser
     return chain.invoke({"context": context, "answer": answer})
 
 
+# 正确性判断
 def judge_correctness(ground_truth: str, answer: str) -> dict:
     """返回 {"consistent": bool, "reason": str}。"""
     prompt = ChatPromptTemplate.from_template(CORRECTNESS_PROMPT)
     output_parser = JsonOutputParser()
-    chain = prompt | chat_model | output_parser
+    chain = prompt | get_chat_model("judge") | output_parser
     return chain.invoke({"ground_truth": ground_truth, "answer": answer})
 
 

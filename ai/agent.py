@@ -1,6 +1,6 @@
 from langchain.agents import create_agent
 
-from ai.client import chat_model
+from llm.factory import get_chat_model
 from ai.tools import UserCtx, today_report, report_by_date, search_foods_tool, query_food_tool,add_meal, delete_meal,search_knowledge
 
 TOOLS = [today_report, report_by_date, search_foods_tool, query_food_tool, add_meal, delete_meal,search_knowledge]
@@ -41,7 +41,7 @@ SYSTEM_PROMPT =  """你是健身饮食助手，帮用户查询与记录饮食。
 def _make_agent(today: str, target: dict, goal: str):
     """构建 agent。每次新建（实测约 1.7ms），确保提示词里的日期不会过期。"""
     return create_agent(
-        model=chat_model,
+        model=get_chat_model(),
         tools=TOOLS,
         context_schema=UserCtx,
         system_prompt=SYSTEM_PROMPT.format(today=today, goal=goal, **target),

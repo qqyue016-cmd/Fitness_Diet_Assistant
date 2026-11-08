@@ -1,6 +1,8 @@
-from ai.client import chat_model
+from llm.factory import get_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+
+chat_model = get_chat_model()
 
 prompt = ChatPromptTemplate.from_messages(
     [
