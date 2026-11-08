@@ -2233,3 +2233,114 @@ R@3 = 96.7%  R@1 = 90.0%  MRR = 0.9333   未命中 1 题（id=6, gold=02_s2）
 - **「补语料有用吗」**：检索层无变化（R@3 / R@1 / MRR 与 miss 全部一致），说明 35 块规模下排序由标题前缀主导，增补同主题细节不改变块的相对位置。真正的影响在回答层面：模型不再需要自己「补」能量密度。但这一点的验证被 judge 缺陷挡住了，要等修复后重测。
 
 - **「为什么新开一个 `##` 小节是错的」**：会让 chunk 从 35 变 36，历史上所有基线数字的分母和块集合都变，对照实验直接作废。**改数据与改口径必须分开做**，这条在工业界的 A/B 实验里同理。
+
+---
+
+## 2026-11-08 ｜ V1.5 第 0 块：模型工厂与依赖方向修正
+
+### 一、今日目标
+
+原定目标：消除 `rag/vector_store.py` 对 `ai.client.embedding_model` 的反向依赖，把模型初始化下沉，为 V1.5 加 API 层扫清障碍。
+
+执行过程中这个目标本身被推翻了一次，见「三、问题 1」。最终交付的是：**新建 `llm/` 模型工厂，让模型相关的一切只有一个入口**。
+
+### 二、完成的事
+
+**1. 新增 `llm/` 模型工厂**
+
+| 文件 | 内容 |
+|---|---|
+| `llm/__init__.py` | 空文件（保证 `import llm` 不触发任何构造） |
+| `llm/factory.py` | `get_chat_model(role)` / `get_embedding_model()`，`lru_cache` 单例，`_get_api_key()` 统一读环境变量 |
+| `config/llm.yaml` | `provider`（base_url + api_key_env）、`chat.default`、`chat.judge`、`embedding` |
+
+四项能力：配置驱动、按角色分档（`default` 对话 / `judge` 判分）、单例缓存、`api_key` 缺失在构造期显式报错。
+
+**2. 删除 `ai/client.py`，4 处引用改造**
+
+| 位置 | 改法 | 依据 |
+|---|---|---|
+| `ai/parser.py` | 模块级 `chat_model = get_chat_model()` | `chain` 在模块级组装，必须有对象 |
+| `ai/agent.py` | `_make_agent()` 内 `model=get_chat_model()` | 只在函数内用，可以真延迟 |
+| `rag/vector_store.py` | `__init__` 内 `get_embedding_model()` | 同上 |
+| `evals/generation_eval.py` | 生成用 `get_chat_model()`，两个 judge 用 `get_chat_model("judge")` | 生成 / 判分角色分离 |
+
+两处用法差异值得记：**模块级组装的链（parser）必须在模块级取对象；只在函数内使用的（agent）应该延迟到函数内**。这正是「工厂 + 缓存」比「一个全局实例」更合适的地方。
+
+**3. 顺手修掉判分器的示例泄漏**
+
+`FAITHFULNESS_PROMPT` 的示例从 `1g 脂肪 = 9 kcal（资料未提及能量密度）` 换成与语料无关的中性占位。这是 10-27 就该做的一行改动，一直悬着。
+
+**4. 文档同步**：README 架构图、层表、`ai/` 模块表、目录树、生成层基线表述、已知局限第 4 条、版本表，全部对齐。
+
+验证结果：`import llm.factory` OK；`get_chat_model("judge")` → `qwen-plus` / `streaming=False` / `max_retries=2`；实跑 `generate_answer` 返回正常中文、`judge_faithfulness` 返回 `{'supported_ratio': 1.0, 'unsupported_claims': []}`；`pytest` **73 passed**；检索基线 **R@3 96.7% / R@1 90.0% / MRR 0.9333**，miss 仍是 id=6，逐位不变。
+
+### 三、遇到的问题与解决
+
+**问题 1：判据本身是错的**
+
+我给的验收标准是「把 `ai/` 和 `rag/` 整个删掉，项目照样能跑」。这句话有两处硬伤：
+
+| 硬伤 | 实测证据 |
+|---|---|
+| `app.py` 第 7-8 行在**模块顶层** import `ai.agent` / `ai.pipeline` | 删掉 `ai/` 不是「AI 功能消失、手工记录还在」，而是 Streamlit 进程根本起不来 |
+| `rag/` 没有独立产品形态 | 它只做「检索返回片段」，「基于片段作答」在 `ai/agent.py` 的 system prompt 里。删掉 ai 后 `search` / `build_context` / `parse_sources` 全部失去调用方 |
+
+还有一条更隐蔽的耦合：`utils/config_tool.py` 在**模块级**加载全部 5 个 yaml。实测临时移走 `config/chroma.yaml` 后，`import utils.config_tool` 直接 `FileNotFoundError` —— 而 `db.py` 依赖它，**整条确定性链路跟着挂**。这条用 grep import 根本查不出来。
+
+修正后的判据拆成两条，各管一件事：
+
+- **依赖单向性**：`rag` 的 import 图不含 `ai`（`sys.modules['ai']=None` 后仍能导入，1 秒可验）
+- **变更不向下渗透**：换模型 / 换检索 / 重构编排，不需要动 `db` / `calc` / `service`
+
+不再追求「可删除」，因为本项目是 AI 与后端一体交付的产品，不是插件系统。**分层的价值是限制变更的传导范围，不是构建可裁剪性。**
+
+**问题 2：`load_llm_config` 被当成字典用**
+
+```python
+model=load_llm_config["chat"]["default"]["model"]
+→ TypeError: 'function' object is not subscriptable
+```
+
+`load_llm_config` 是函数，值已经存在 `config_tool` 的模块级 `config_llm` 里。改为 `config_llm[...]` 即可，与 `db.py` 用 `config_sqlite`、`vector_store.py` 用 `config_chroma` 是同一种写法。
+
+这和我 10-25 那次 `full_tittle("：")`（把字符串当函数调）**是同一族错误、方向相反**：核心都是「值」和「产生值的函数」没分清。
+
+**问题 3：`judge` 档缺 `max_retries`**
+
+`factory.py` 用 `cfg["max_retries"]` 硬索引，而 `judge` 档只写了 `model` / `temperature` / `streaming`，于是 `get_chat_model("judge")` 直接 `KeyError`。**判分路径完全不可用，但 import 阶段发现不了。**
+
+修法不是简单补 yaml，而是区分「哪个字段有公认默认值」：`model` 保持硬索引（缺失就该报错），`temperature` / `streaming` / `max_retries` 用 `.get()` 带默认值。以后加第三档忘写某个字段也不会炸。
+
+**问题 4：`generation_eval.py` 两个错，而 73 条单测全绿**
+
+- 第 4 行只导入了 `get_embedding_model`，**没导 `get_chat_model`** → 第 58 / 66 行的 `get_chat_model("judge")` 一调用就 `NameError`
+- 第 50 行 `generate_answer` 把 **embedding 模型**接到了生成链上 → `chain.invoke(...).content` 必崩
+
+**关键事实：这两处错误 pytest 全部测不到。**因为 `pytest` 从不 import `evals/generation_eval.py`，而 `import` 本身也不报错——`NameError` 发生在函数体执行时的名字解析。`python -m evals.run_eval` 会一路跑到判分那步才炸，前面的 API 调用全白花。
+
+这个错误也是「角色错位」：`get_chat_model` 该出现在对话/生成侧，`get_embedding_model` 该出现在向量化侧，`judge` 只能出现在判分侧。三个角色混了。
+
+### 四、可迁移的规则
+
+- **判据必须能在当前代码状态下被证伪**：我写的「删掉 ai 照跑」听起来像工程直觉，实际上 `app.py` 第 7 行就否掉了它。判断一条验收标准是否有效，第一步是问「现在跑这条判据，输出是什么」。
+
+- **单测绿 ≠ 模块可用**：没有被测试导入的模块，等于没有覆盖。这次 73 条全过，评测脚本却是坏的。**未被覆盖的入口，必须至少实跑一次主路径**，而不是靠 import 检查代替。
+
+- **硬索引与默认值要有明确分界**：有公认默认值的字段用 `.get(..., default)`，没有的（如 `model`）保持硬索引以便失败得早。全用 `.get` 会掩盖配置缺失，全用硬索引会让每加一个档都可能漏字段。
+
+- **可调项进配置，必须项留代码**：`check_embedding_ctx_length=False` 不进 yaml，因为它是服务约束不是参数。**半生效的配置比没有配置更危险**——改 yaml 没反应时，人会先怀疑网络。
+
+- **模块级加载是隐形的强耦合**：`config_tool` 在模块级读 5 个 yaml，意味着删掉任何一个配置文件都会让整个项目起不来。这类耦合不在 import 语句里，只在执行时机里。
+
+- **层的价值是限制传导，不是支持裁剪**：把「能否删掉某层」当分层设计的验收标准，会逼着代码为一个不存在的使用场景服务。
+
+### 五、今天产出的面试素材
+
+- **「为什么单独抽一个模型工厂」**：不是为了好看。我踩过三个具体的坑——`qwen-plus` 欠费停服时我是在代码里改字符串常量换模型；`base_url` 在 chat 和 embedding 两处各写一遍，换供应商要改两处；`api_key` 缺失时 `ChatOpenAI` 构造不报错，要等第一次调用才返回 401，错误信息离根因很远。工厂把这三件事各自收敛成一个点：改 yaml、单一 base_url、构造期校验。
+
+- **「按角色分档解决了什么问题」**：评测里判分模型和生成模型如果是同一个，会出现自我偏袒。我要做「换一个 judge 看指标怎么变」的对照实验，如果模型是全局单例，这个实验就得改代码；分档之后是改一行 yaml。**可实验性本身是架构属性**。
+
+- **「你怎么验证一次重构没有改坏行为」**：三条。检索基线逐位比对（R@3 / R@1 / MRR 和 miss 的题目 id 都要一样，任何一位变化都说明行为动了）；单测全绿；另外补一条「实跑主路径」——因为这次就是 73 条全绿而评测脚本是坏的。**重构的验证不是「测试过了」，是「同一个输入产生同一个输出」**。
+
+- **「分层的验收标准是什么」**：我先写错过一次。原判据是「删掉 AI 层项目还能跑」，但主入口 `app.py` 在模块顶层 import 了 AI，一删整个应用起不来；而且 RAG 只输出片段、不做作答，删掉消费方它就是个死模块。正确的判据是两条：**依赖单向**（`rag` 不 import `ai`，可用 `sys.modules` 屏蔽验证）和**变更不向下渗透**（换模型不用动 `db` / `calc` / `service`）。这个项目是 AI 与后端一体交付的产品，不是插件系统，追求「可裁剪」是在为一个不存在的场景写代码。
