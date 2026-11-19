@@ -5,3 +5,7 @@ langchain==1.4.6
 langchain_community==0.4.2
 langchain-openai==1.7.2
 openai==3.35.1
+pydantic==2.14.1
+uvicorn==0.54.0
+http==0.28.1
+fastapi==0.165.0

@@ -11,3 +11,4 @@ data/chroma/
 
 # 本地实验数据，不公开
 实验数据.md
+evals/results/*.json
