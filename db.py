@@ -107,9 +107,9 @@ def search_foods(keyword: str) -> list[dict]:
     try:
         sql_text = f'''
         SELECT * FROM {config_sqlite['TABLE_NAME']}
-        WHERE name LIKE ? ORDER BY name
+        WHERE instr(name, ?) >0 ORDER BY name
         '''
-        result = cursor.execute(sql_text,(f"%{keyword}%",))
+        result = cursor.execute(sql_text,(keyword,))
         return [dict(r) for r in result]
     except sqlite3.Error as e:
         raise RuntimeError(f'查询数据失败：{str(e)}') from e

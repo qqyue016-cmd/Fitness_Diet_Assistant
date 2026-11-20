@@ -10,8 +10,6 @@ from db import (
     query_food,
     search_foods,
 )
-from scripts.init_db import init_table
-
 from tests.conftest import TEST_DATE
 
 
@@ -51,6 +49,11 @@ def test_search_foods_no_result():
     assert search_foods('火鸡') == []
 
 
+def test_search_foods_wildcard_is_literal():
+    assert search_foods('%') == []
+    assert search_foods('_') == []
+
+
 # ── 数据完整性约束 ────────────────────────────────────
 def test_foods_rejects_null_nutrient():
     """营养字段的 NOT NULL 约束必须生效。
@@ -69,6 +72,7 @@ def test_foods_rejects_null_nutrient():
     finally:
         conn.rollback()
         conn.close()
+
 
 # ── add_intake：新增摄入 ──────────────────────────────
 def test_add_intake_returns_id():
