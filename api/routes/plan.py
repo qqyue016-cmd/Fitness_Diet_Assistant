@@ -1,8 +1,10 @@
 from fastapi import APIRouter
-from api.schemas import PlanOut , ProfileIn
-import service
 
-router = APIRouter(prefix='/api/v1',tags=['plan'])
+import service
+from api.schemas import PlanOut, ProfileIn
+
+router = APIRouter(prefix='/api/v1', tags=['plan'])
+
 
 @router.post('/plan', response_model=PlanOut)
 def create_plan(body: ProfileIn):
@@ -14,5 +16,3 @@ def create_plan(body: ProfileIn):
         activity_level=body.activity_level,
         goal=body.goal,
     )
-
-

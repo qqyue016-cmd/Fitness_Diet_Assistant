@@ -1,9 +1,6 @@
-from pydantic import BaseModel, Field
 from typing import Literal
 
-activity_level = ['sedentary', 'light', 'moderate', 'high', 'extreme']
-goal = ['muscle_gain', 'fat_loss', 'maintain']
-gender = ['male', 'female']
+from pydantic import BaseModel, Field
 
 
 class ProfileIn(BaseModel):
