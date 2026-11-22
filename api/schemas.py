@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from ai.guard import MAX_GRAMS
 
-
+# 计划
 class ProfileIn(BaseModel):
     gender: Literal['male', 'female'] = Field(..., description='性别')
     weight_kg: float = Field(..., gt=0, le=300, description='体重')
@@ -36,7 +36,7 @@ class FoodOut(BaseModel):
     carb: float
     source: str
 
-
+# 饮食记录
 class IntakeCreate(BaseModel):
     date: datetime.date
     food_name: str = Field(..., min_length=1)
@@ -56,7 +56,7 @@ class IntakeRecordOut(BaseModel):
     food: str
     grams: float
 
-
+# 每日总结
 class DailySummaryIn(BaseModel):
     date: datetime.date
     target: TargetOut
@@ -90,3 +90,35 @@ class DailySummaryOut(BaseModel):
     items: list[IntakeItemOut]
     total: NutrientTotal
     gap: NutrientGap
+
+# parse
+class ParseIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=200, description='口语描述，如「中午吃了一碗米饭和两个鸡蛋」')
+
+class ParsedOKOut(BaseModel):
+    raw: str
+    food: str
+    grams: float | None
+
+
+class ParsedAmbiguousOut(BaseModel):
+    raw: str
+    candidates: list[str]
+    grams: float | None
+
+
+class ParsedNotFoundOut(BaseModel):
+    raw: str
+    grams: float | None
+
+
+class ParsedInvalidOut(BaseModel):
+    raw: str
+    grams: float | None
+    reason: str
+
+class ParseOut(BaseModel):
+    ok: list[ParsedOKOut]
+    ambiguous: list[ParsedAmbiguousOut]
+    not_found: list[ParsedNotFoundOut]
+    invalid: list[ParsedInvalidOut]

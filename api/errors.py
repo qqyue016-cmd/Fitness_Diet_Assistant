@@ -4,7 +4,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-
 class ErrorBody(BaseModel):
     code: str
     message: str
@@ -38,6 +37,11 @@ class IntakeNotFound(ApiError):
 class InvalidParam(ApiError):
     status_code = 422
     code = 'VALIDATION_ERROR'
+
+
+class AIUpstreamError(ApiError):
+    status_code = 502
+    code = 'AI_UPSTREAM_ERROR'
 
 
 def _response(status_code: int, code: str, message: str, detail: list | None = None):
