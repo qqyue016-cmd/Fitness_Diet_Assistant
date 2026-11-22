@@ -111,7 +111,9 @@ db.py · calc.py   │            Chroma（向量索引）
 pip install -r requirements.txt
 python scripts/init_db.py          # 建表并导入食物数据
 python -m rag.vector_store         # 建向量索引（35 个知识块）
-streamlit run app.py
+
+streamlit run app.py               # UI，默认 8501
+uvicorn api.main:app --reload      # REST API，默认 8000
 ```
 
 评测（需要 `DASHSCOPE_API_KEY`）：
@@ -121,15 +123,62 @@ python -m evals.retrieval_eval     # 只跑检索层，不消耗生成额度
 python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果落盘到 evals/results/
 ```
 
-浏览器打开 `http://localhost:8501`。
+浏览器打开 `http://localhost:8501`（UI）或 `http://localhost:8000/docs`（API 文档）。两个进程独立启动——Streamlit 的重跑模型会反复触发 FastAPI 启动，不要塞进同一个进程。
 
 > 使用自然语言记录功能，需配置环境变量 `DASHSCOPE_API_KEY`（阿里百炼）。未配置时手动记录与营养计划功能仍可正常使用。
+
+## API
+
+`api/` 是 V1.5 新增的 REST 层，采用 `api → service / db / calc` 的单向依赖，下层不得回引。当前完成 **7 个确定性端点**（不调用 LLM），AI 三条链路因需要 SSE 流式，属下一批。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| POST | `/api/v1/plan` | 由身体信息生成 BMR / TDEE / 宏量目标 |
+| GET | `/api/v1/foods?name=` | 按名称精确查询单个食物 |
+| GET | `/api/v1/foods/search?keyword=&limit=` | 关键词模糊搜索（下拉补全） |
+| POST | `/api/v1/intake` | 记录一笔摄入 |
+| GET | `/api/v1/intake?date=` | 查某日摄入明细（`date` 缺省为今天） |
+| DELETE | `/api/v1/intake/{id}` | 删除一笔摄入，成功返回 204 |
+| POST | `/api/v1/summary` | 某日汇总：明细 / 已摄入 / 缺口 |
+
+统一错误体（`code` 给机器分支，`message` 给人看）：
+
+```json
+{"error": {"code": "FOOD_NOT_FOUND", "message": "食物不存在：榴莲", "detail": null}}
+```
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 422 | `VALIDATION_ERROR` | 字段类型错 / 越界 / 枚举非法 / 日期格式非法 |
+| 404 | `FOOD_NOT_FOUND` | 食物名不存在 |
+| 404 | `INTAKE_NOT_FOUND` | 删除的 id 不存在 |
+| 500 | `DATABASE_ERROR` | 数据访问失败 |
+| 500 | `INTERNAL_ERROR` | 未预期异常 |
+
+几个刻意的设计选择：
+
+- **`response_model` 是白名单不是注解**：`db` 层 `SELECT *` 返回全部列，响应模型只声明对外字段，多出来的自动裁掉，表加列或加敏感字段都自动安全。
+- **输入约束只放在请求模型**：响应模型加 `gt/le` 会让「库里有一条超范围的旧记录」变成「接口 500」——那是否认自己的数据。
+- **`Literal` 代替 `str` 收枚举**：Swagger 自动渲染下拉框，非法值在进入函数体前被拦成 422，而不是在 `calc` 深处抛 `KeyError: 'moderate '`。
+- **端点用普通 `def` 而非 `async def`**：`db` 是 `sqlite3` 同步驱动、`service` 是纯 CPU 计算，全程无 `await`。写成 `async def` 会让请求在事件循环里串行排队，普通 `def` 由 FastAPI 自动丢进线程池。
+
+> 当前 Streamlit 仍直连 `db`/`service`，尚未切到 API。切换属后续步骤——先把服务端做稳，再动 UI 的数据来源。
 
 ## 目录结构
 
 ```
 Fitness_Diet_Assistant/
 ├── app.py                  # Streamlit 应用入口（我的计划 / 今日记录）
+├── api/                    # REST 层（V1.5）
+│   ├── main.py             # 应用装配 + 路由注册
+│   ├── deps.py             # 依赖（日期参数）
+│   ├── errors.py           # 统一错误契约 + 4 个处理器
+│   ├── schemas.py          # 请求 / 响应模型
+│   └── routes/
+│       ├── plan.py         # POST /plan
+│       ├── foods.py        # GET /foods · /foods/search
+│       ├── intake.py       # POST / GET / DELETE /intake
+│       └── summary.py      # POST /summary
 ├── pages/
 │   └── 1_AI_Mode.py        # AI 对话助手（独立页面）
 ├── service.py              # 业务编排层
@@ -286,8 +335,8 @@ python -m evals.run_eval 5         # 只跑前 5 题，调 prompt 时用
 | 版本 | 状态 | 主要内容 |
 |---|---|---|
 | **V1** | 已完成 | 确定性内核：食物库 · 营养计算 · 摄入记录 · 缺口分析 · Streamlit |
-| **V2** | 已完成 | 自然语言解析 · 确定性护栏 · 分级确认 UI · Tool Calling（7 个工具）· 流式多轮对话 · 对话式写库 · **营养知识 RAG（含引用溯源）** · **双层评测框架（检索 R@3 96.7%，三次复测零波动）** · **模型工厂（配置驱动 + 角色分档）** · 73 条单测<br>已知缺口：生成层判分器未校准，不发布基线（见「已知局限」）；Rerank 待判分器就绪后做对照 |
-| V1.5 | 待开始 | FastAPI + Pydantic 校验 + MySQL + Redis + 认证 |
+| **V2** | 已完成 | 自然语言解析 · 确定性护栏 · 分级确认 UI · Tool Calling（7 个工具）· 流式多轮对话 · 对话式写库 · **营养知识 RAG（含引用溯源）** · **双层评测框架（检索 R@3 96.7%，三次复测零波动）** · **模型工厂（配置驱动 + 角色分档）** · 74 条单测<br>已知缺口：生成层判分器未校准，不发布基线（见「已知局限」）；Rerank 待判分器就绪后做对照 |
+| **V1.5** | 进行中 | 已完成：**REST 层**（7 个确定性端点 · Pydantic 校验 · 统一错误契约 · 全链路数值验收）<br>待做：AI 三链路 SSE · Streamlit 改调 API · Docker · 公网 demo · JWT · MySQL / Redis |
 | V3 | 待开始 | 查询改写（口语 → 检索式表达）· 多步编排（LangGraph，跨工具的组合任务） |
 
 设计思路：先用确定性代码把领域逻辑固化好，再让 LLM 承担调度层——比直接堆 prompt 更可控、可测试。

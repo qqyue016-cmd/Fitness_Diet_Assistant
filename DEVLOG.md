@@ -2526,7 +2526,7 @@ search_foods('_')  → 104 条（全表）
 
 `{keyword}` 是 set 字面量，`({keyword},)` 是「一个元组，元素是 set」。语法完全合法，所以不报 SyntaxError，一路到运行时才 `ProgrammingError: Error binding parameter 1: type 'set' is not supported`。正确写法 `(keyword,)`——**花括号在 Python 里只有 set / dict / f-string 占位三种身份，参数元组只需要圆括号加逗号**。
 
-**问题四：`if foods is None` 是死代码（已定位，待修）**
+**问题四：`if foods is None` 是死代码（已修）**
 
 `/foods/search` 的空白校验写成了：
 
@@ -2538,13 +2538,16 @@ if foods is None:            # search_foods 返回 list，永远不可能是 Non
 
 `db.search_foods` 的返回类型是 `list[dict]`，空结果是 `[]` 不是 `None`，分支永远进不去。实测 `keyword=%20`（一个空格）仍返回 200 + `[]`，没有变成 422。
 
-正确位置在查询**之前**，检查对象是 keyword 而不是查询结果：
+修正方式——位置前移到查询**之前**，检查对象从查询结果换回 keyword，并补上 `strip()`：
 
 ```python
 kw = keyword.strip()
 if not kw:
     raise InvalidParam('keyword 不能为空白')
+return db.search_foods(kw)[:limit]
 ```
+
+修后实测：`?keyword=%20`（URL 编码的单空格）→ 422 `VALIDATION_ERROR`；`keyword=' 鸡 '` → 200 且正常命中 4 条，`strip()` 不影响带空格的合法输入。
 
 这条暴露的问题比 bug 本身更值钱：**74 条测试全绿，但没有任何一条能进入这个分支，因为它不可达**。测试覆盖率统计的是「哪些行被执行过」，不统计「哪些分支永远进不去」。
 
@@ -2573,3 +2576,157 @@ if not kw:
 - **「怎么保证接口不漏字段」**：`response_model` 是白名单不是注解。`db` 层 `SELECT *` 返回全部列，`FoodOut` 只声明 6 个，多出来的被裁掉。这个设计在「表加了一列」和「以后加了敏感字段」两种情况下都自动安全，不需要记得回头改返回语句。
 
 - **「发现自己代码有问题怎么处理」**：这次自查出 `if foods is None` 是死代码。值得讲的不是 bug 本身，是它为什么能活到自查——74 条测试全绿给了虚假安全感，而**覆盖率只统计「哪些行被执行过」，不统计「哪些分支永远进不去」**。所以自查看的不是测试报告，是把每个 `if` 的条件单独拎出来问一句「它可能为真吗」。
+
+---
+
+## 2026-11-22 ｜ V1.5 第 1 块完成：7 个确定性端点与全链路验收
+
+### 一、今日目标
+
+补齐 `/intake` 三个端点与 `/summary`，把第 1 块收口，并在 `/docs` 里跑通「计划 → 记录 → 汇总 → 删除」全链路（契约第六节的四步）。
+
+### 二、完成的事
+
+**1. `api/deps.py`：唯一一个 `Depends`**
+
+```python
+def get_date(date: datetime.date | None = Query(None)) -> str:
+    return (date or datetime.date.today()).isoformat()
+```
+
+依赖承担三件事：缺省值（今天）、类型校验、格式化成 `db` 能吃的字符串。返回值直接是 `str`，路由函数体里不需要再 `.isoformat()`。
+
+**只服务 `GET /intake`。** 契约原本写「供 `/intake` 与 `/summary/daily` 共用」，这个说法不成立——`/summary` 的 `date` 在请求体里，走 JSON 解析路径，用不上 query 依赖。强行统一会让 Swagger 上的调用方式变怪，所以契约已改。
+
+**2. `api/routes/intake.py`：三个端点**
+
+| 方法 | 路径 | 返回 | 失败 |
+|---|---|---|---|
+| POST | `/api/v1/intake` | 201 `IntakeCreateOut` | 食物不存在 → 404 |
+| GET | `/api/v1/intake?date=` | 200 `IntakeRecordOut[]` | 日期非法 → 422 |
+| DELETE | `/api/v1/intake/{id}` | 204 无 body | id 不存在 → 404 |
+
+`POST` 的状态码用 201 而非 200：创建成功在 REST 语义上是 201，契约未规定，保留 201。
+
+**3. `api/routes/summary.py`：一个端点**
+
+```python
+return service.build_daily_report(body.date.isoformat(), body.target.model_dump())
+```
+
+两个转换都不能省，见问题四、问题三。
+
+**4. 全链路验收（`/docs` 等价路径，TestClient 实跑）**
+
+| 步骤 | 结果 |
+|---|---|
+| `POST /plan` | 200，target `3010.20 kcal / P126 / F63 / C484.8` |
+| `POST /intake` 鸡胸肉 200g | 201，`id=886` |
+| `POST /intake` 白米饭 150g | 201，`id=887` |
+| `POST /summary` | 200，`items` 2 条 |
+| `DELETE /intake/886`、`/887` | 204、204 |
+| `GET /intake?date=2000-01-01` | 200 `[]` |
+| 删后 `POST /summary` | 200，`items=0`、`total` 全 0 |
+
+**数值与手算逐位吻合**，这是全链路最重要的一条证据：
+
+```
+total  实测  525.0 / 66.05 / 7.65 / 42.3
+total  手算  525.0 / 66.05 / 7.65 / 42.3      ← 鸡胸 200g + 白米饭 150g
+gap    实测  2485.1969 / 59.95 / 55.35 / 442.4992
+gap    手算  2485.1969 / 59.95 / 55.35 / 442.4992
+```
+
+说明 `calc_food_intake` → `sum_intake` → `calc_gap` 这条链在 API 层没有引入任何偏移或单位错位。另外验证了空摄入时 `gap == target`（`target - 0.0` 精确相等），这是 `calc_gap` 的正确语义——**没吃就是全缺口，不是 0**。
+
+边界：`target` 缺 `carb_g` → 422；`date=2026-13-01` → 422；`DELETE /intake/0`、`/intake/abc` → 422（`Path(ge=1)`）。
+
+**5. 契约同步 11 处**
+
+不止路径。原文与实际实现已经分叉的地方全部对齐：`/summary/daily` → `/summary`（3 处）、3.3 补 `instr` 说明、3.4 失败映射改写、3.5 `date` 改可选、3.6 补 204 约束、`Depends` 说明修正、404 样例「火龙果」→「榴莲」（它在库中，测不出来）、验收 73 → 74 passed。
+
+### 三、遇到的问题
+
+**问题一：`from datetime import datetime` 导的是类不是模块**
+
+`schemas.py` 原本写 `from datetime import datetime`，然后 `date: datetime.date`。属性访问不报错——`datetime.date` 安静地返回 `<method 'date' of 'datetime.datetime' objects>`，因为 `datetime` 类恰好有个实例方法叫 `date`。错误要等到 Pydantic 建 schema 时才暴露：
+
+```
+PydanticSchemaGenerationError: Unable to generate pydantic-core schema
+for <method 'date' of 'datetime.datetime' objects>
+```
+
+这是 **import 期**错误，整个 `api/main.py` 起不来。正确写法是 `import datetime`。
+
+隐蔽之处在于：这个错误不抛 `AttributeError`，报错信息里也看不出「你导错了」，只说这个类型 Pydantic 不认识。
+
+**问题二：Pydantic 模型定义顺序**
+
+`DailySummaryOut` 引用了定义在它后面的 `NutrientTotal` / `NutrientGap`：
+
+```
+NameError: name 'NutrientTotal' is not defined
+  at schemas.py:78  total: NutrientTotal
+```
+
+Python 类体里的注解**在类创建时立即求值**（没有 `from __future__ import annotations` 的前提下）。同一个类里 `items: list[IntakeItemOut]` 没报错，因为 `IntakeItemOut` 恰好定义在前面——这个「碰巧能跑」最容易让人误解成「Pydantic 会自动处理顺序」。
+
+规则：**被依赖的放前面，组合者放最后。**
+
+**问题三：响应模型加了输入约束**
+
+`IntakeCreateOut` / `IntakeRecordOut` 一度写成 `grams: float = Field(..., gt=0, le=MAX_GRAMS)`。这是响应模型，约束该只留在 `IntakeCreate`。
+
+失效路径是真实的：`db.add_intake` 只校验 `grams <= 0`，**没有上限**；上限只存在于 `ai/guard.py` 和 `IntakeCreate`。任何绕过这两条路的写入（直接调 `db`、旧脚本、手工 SQL、将来的批量导入）超过 3000g，`GET /intake` 就会 500——而那条记录是库里客观存在的事实，接口应该如实返回。
+
+**`response_model` 是契约声明，不是校验器。**
+
+**问题四：`calc_gap` 只吃 dict**
+
+`service.build_daily_report` 内部调 `calc.calc_gap(target, total)`，而 `calc_gap` 第 70 行是 `if key not in target`。传 `TargetOut` 对象会抛：
+
+```
+TypeError: argument of type 'TargetOut' is not iterable
+```
+
+必须 `body.target.model_dump()`。
+
+**问题五：`add_intake` 抛三种 `ValueError`，而 `errors.py` 没有 ValueError 处理器**
+
+三种：`'食品不存在'`、`'克数必须大于 0'`、`'日期格式错误'`。
+
+- 不捕获 → 落到兜底 handler，501/500，把「客户端传错食物名」报成服务端故障
+- 笼统 `except ValueError` 转 404 → 把「克数非法」也报成 404，错因被混淆
+
+正确做法是**路由层先 `db.query_food(food_name)` 判存在**，不存在就抛 `FoodNotFound`。代价是多一次 SQLite 本地查询（微秒级），换来语义准确。契约里原写的「捕获 `ValueError('食品不存在')`」已据此改写。
+
+**问题六：同一个「名字写错」，一个 import 期炸，一个运行期炸**
+
+| 写法 | 求值时机 | 后果 |
+|---|---|---|
+| `def f(x = Path(...))` 漏 import `Path` | `def` 执行时（默认参数立即求值） | `NameError`，整个 API 起不来 |
+| 函数体内 `db.create_intake(...)`（实为 `add_intake`） | 调用时 | 单测全绿，但端点一调就 `AttributeError` |
+
+第二种更危险：`pytest` 74 条全过，因为它一条都没覆盖 API 层。只有真的 `POST /intake` 才发现。
+
+### 四、可迁移的规则
+
+**1. 类体注解立即求值，模型定义顺序是硬约束。** 不是风格问题，是 `NameError`。被依赖的模型必须定义在前；组合模型放文件末尾。想绕开可以用 `from __future__ import annotations`，但那会让 Pydantic 在运行期才解析引用、多一层隐式 `model_rebuild`，不值得为排序问题引入。
+
+**2. 输入约束和输出约束要分开看。** 请求模型加 `gt/le` 是拦截脏数据，响应模型加 `gt/le` 是否认自己的数据。后者会让「库里有一条超范围的旧记录」变成「接口 500」。
+
+**3. 名字错误的暴露时机取决于它出现在哪里。** 默认参数 → 定义即报错（安全）；函数体 → 调用才报错（危险）。所以函数体里的跨模块调用（`db.xxx`）必须有端到端测试兜住，单测覆盖不到。
+
+**4. 手动验收必须固化。** 本次三个端点的手工验证花了约 20 分钟，可复用性为零。固化成 TestClient 用例后，下次改 `service.py` 或迁 MySQL 都能一键回归。当前 74 条测试**全部是单元测试，API 层覆盖率为 0**——这是下一件要做的事。
+
+**5. 契约文件必须跟着代码改，否则会变成负债。** 本次同步了 11 处，其中「`/summary/daily`」若留着，下次照契约写就会再踩一次 404；「`date` 必填」若留着，`get_date` 的缺省值逻辑就会被误认为 bug；「火龙果」若留着，验收会永远测不出 404。契约的价值是「照它写就是对的」，一旦失真就是负资产。
+
+### 五、今天产出的面试素材
+
+- **「为什么 `service.py` 只有两个函数，不给每个端点配一个 service 方法」**：`api → db` 属向下依赖，是允许的。为了「每层都要有一个 service 函数」而新增中转，会把 37 行的 `service` 膨胀成纯转发的空壳——多一层调用、多一个要改的地方、零信息增量。**分层的目的是隔离变化，不是画对称的图。**
+
+- **「为什么 `/summary` 要求客户端回传 target」**：当前没有用户表、没有画像持久化，target 一直存在 Streamlit 的 `session_state` 里。第 1 块用无状态设计：客户端从 `/plan` 拿到 target，调汇总时回传。代价是客户端要保管它，收益是不引入 profile 表、不把第 1 块的范围撑大。等第 3 块做 JWT + `user_id` 时 profile 表自然落地，**接口契约不变，只改内部实现**。
+
+- **「`Depends` 你用在哪些地方」**：只用了一处，`get_date`。判断标准是「它是否消除了真实重复」：日期参数在三个端点出现，但 `/summary` 的 date 在 body 里、走 JSON 解析，只有 `GET /intake` 用得上 query 依赖，所以只服务一个端点——剩下的价值来自缺省值（今天）和格式化，不是「复用」。`db.get_connect` 做不了依赖，因为 `db.py` 的连接是函数内自建自关，没有可注入对象，硬加要重构 9 个函数。**依赖注入需要被注入的对象先存在。**
+
+- **「怎么验证一条看起来对的链路」**：不看返回码，看数值。本次 `total` 的四个字段全部手算对照（鸡胸 200g：330/62/7.2/0，白米饭 150g：195/4.05/0.45/42.3），实测与手算逐位相同，才敢说 `calc_food_intake → sum_intake → calc_gap` 没被 API 层污染。**返回 200 只证明没有异常，不证明算对了。**
