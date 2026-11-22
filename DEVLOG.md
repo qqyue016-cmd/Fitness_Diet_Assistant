@@ -2730,3 +2730,124 @@ TypeError: argument of type 'TargetOut' is not iterable
 - **「`Depends` 你用在哪些地方」**：只用了一处，`get_date`。判断标准是「它是否消除了真实重复」：日期参数在三个端点出现，但 `/summary` 的 date 在 body 里、走 JSON 解析，只有 `GET /intake` 用得上 query 依赖，所以只服务一个端点——剩下的价值来自缺省值（今天）和格式化，不是「复用」。`db.get_connect` 做不了依赖，因为 `db.py` 的连接是函数内自建自关，没有可注入对象，硬加要重构 9 个函数。**依赖注入需要被注入的对象先存在。**
 
 - **「怎么验证一条看起来对的链路」**：不看返回码，看数值。本次 `total` 的四个字段全部手算对照（鸡胸 200g：330/62/7.2/0，白米饭 150g：195/4.05/0.45/42.3），实测与手算逐位相同，才敢说 `calc_food_intake → sum_intake → calc_gap` 没被 API 层污染。**返回 200 只证明没有异常，不证明算对了。**
+
+---
+
+## 2026-11-22 ｜ V1.5 第 2 块启动：`/parse` 端点与 AI 依赖的边界
+
+### 一、这一块要解决什么
+
+`/parse` 是第一个调用 LLM 的端点，也是第一条要把 AI 层的异常翻译成 HTTP 语义的路径。它不流式（`parse_and_validate` 一次性返回），所以能用普通 JSON 响应，不必先啃 SSE 协议。用它把 `AIServiceError → 502` 这条映射打通，是 `/chat` 之前成本最低的一步。
+
+### 二、完成的事
+
+**1. 错误契约新增 502**
+
+```python
+class AIUpstreamError(ApiError):
+    status_code = 502
+    code = 'AI_UPSTREAM_ERROR'
+```
+
+`errors.py` **没有**注册 `AIServiceError` 的处理器。这是刻意的：`errors.py` 是横切模块，让它在 import 期依赖 `ai.pipeline` 会把 AI 依赖塞进错误契约，AI 层一坏整个错误处理就不可用。AI 的异常在路由层翻译成 `AIUpstreamError`。
+
+**2. 五个请求 / 响应模型**
+
+`ParseIn`（`text`，1~200 字）+ `ParseOut` 的四个子结构（`ParsedOKOut` / `ParsedAmbiguousOut` / `ParsedNotFoundOut` / `ParsedInvalidOut`），字段与 `guard.py` 的输出逐一对齐。
+
+**3. `api/routes/ai_parse.py`**
+
+```python
+@router.post('/parse', response_model=ParseOut)
+def parse(body: ParseIn):
+    try:
+        return parse_and_validate(body.text)
+    except AIServiceError as e:
+        raise AIUpstreamError('AI 解析服务不可用', [{'raw': str(e)}]) from e
+```
+
+**4. 实测结果（8 个端点全通）**
+
+| 场景 | 结果 |
+|---|---|
+| `text=''` / 201 字 / 缺字段 | 422 `VALIDATION_ERROR`（三条） |
+| 真实解析「一碗米饭和两个鸡蛋，还有一杯牛奶」 | 200，2.4s，`ok` 1 + `ambiguous` 2（米饭→白/糙，牛奶→全脂/脱脂） |
+| `meal_parser` 抛 `RuntimeError` | 502 `AI_UPSTREAM_ERROR` |
+| `validate_meal` 抛异常 | 500 `INTERNAL_ERROR`（护栏代码的 bug，不伪装成上游故障） |
+| 原 7 端点回归 | `/plan` 3010.1969 kcal · `/summary` total `525.0/66.05/7.65/42.3`（与 11-22 手算逐位相同） |
+
+`pytest` **74 passed**。
+
+### 三、遇到的问题
+
+**问题一：路由文件写完了，但没在 `main.py` 注册**
+
+`api/routes/ai_parse.py` 的五个分支单独挂到临时 app 上跑，全部正确；挂到真实 `api.main` 上，`/api/v1/parse` 是 **404**。原因是 `main.py` 少了 `from api.routes import ai_parse` 与 `app.include_router(ai_parse.router)`。
+
+这是「名字写错」的第三种暴露形态，比前两种都隐蔽：
+
+| 错误位置 | 求值时机 | 后果 | 能否被现有检查发现 |
+|---|---|---|---|
+| 默认参数里的未定义名 | `def` 执行时 | `NameError`，API 起不来 | `import` 即失败，一定能发现 |
+| 函数体里的错误函数名 | 调用时 | `AttributeError` | 单测不覆盖 → 只有真调用才发现 |
+| **漏写 `include_router`** | — | **静默 404，无任何异常** | `import` 正常、`pytest` 全绿、日志干净 |
+
+第三种没有任何报错，只有一个「端点不存在」的响应。它不会出现在任何测试报告里，只出现在真实请求中。
+
+**问题二：`app.routes` 在这个 FastAPI 版本上枚举不到子路由**
+
+自查方式失效。原本想用「列出 `app.routes` 里的 `/api/` 路径」确认挂载，实测：
+
+```
+app.routes 总数 : 9
+  Route /openapi.json
+  Route /docs
+  Route /docs/oauth2-redirect
+  Route /redoc
+  _IncludedRouter ?      ← 五个 include_router 被包装成这个
+  ...
+```
+
+当前 FastAPI 版本把 `include_router` 的结果包装成 `_IncludedRouter`，**不再展开**到 `app.routes`。所以按旧写法筛 `r.path` 只能拿到 4 个内置路由，连已经工作了两天的 `/plan`、`/intake` 都不显示。
+
+可靠的自检方式只有两个：`app.openapi()['paths']`，或者 `TestClient` 真发一次请求。**「用框架内部结构做自检」这件事本身不可靠 —— 内部结构会变，而且变了不报错。**
+
+**问题三：`api/routes/ai.py` 与顶层包 `ai` 同名，产生名字遮蔽**
+
+路由文件原名 `ai.py`，`from api.routes import ai` 本身能工作。但只要同一个模块里再出现 `import ai.pipeline`，后者会把名字 `ai` 重绑定到**顶层 `ai` 包**，`ai.router` 立刻变成 `AttributeError: module 'ai' has no attribute 'router'`。
+
+这个坑在写测试时暴露的（测试文件通常同时需要路由和它依赖的模块）。改名为 `ai_parse.py` 后消失 —— 路由模块名不要与被调用包的顶层名相同。
+
+**问题四：`grams: float | None` 不是可选项**
+
+`ParseOut` 的四个子结构里 `grams` 全部允许 `None`。`guard.py:44` 的注释写明「grams 可能为 None，待用户补」——模型没提取到克数时就是这个状态。
+
+写成 `grams: float` 会在 `response_model` 校验期抛 `ResponseValidationError` → 500。危险之处在于**真实调用不一定触发**：本次实测那句「一碗米饭和两个鸡蛋，还有一杯牛奶」三个食物的 grams 全有值（150/100/250），看不出问题。要构造「吃了一点米饭」这类无量的表述才会暴露。
+
+**问题五：502 的语义边界**
+
+`AIServiceError` 覆盖超时、限流、网络、key 缺失。定 502 而非 500 的依据是**客户端重试是否有意义**：限流和超时重试可能成功，那属于上游不可用（5xx 的 502/503/504）；代码 bug 重试必然失败（500）。
+
+但 502 只在**响应头发出之前**成立。这一条对 `/parse` 无所谓（非流式，异常发生在返回之前），对 `/chat` 是硬约束：SSE 一旦开始推流，`200` 已经发出去了，中途的上游故障只能写进流里的 `event: error`，改不了状态码。**同一个异常类，在流式和非流式端点上有两种处理路径。**
+
+### 四、可迁移的规则
+
+**1. 静默失败比报错更需要测试兜底。** 漏注册路由、响应模型字段名拼错、`response_model` 裁掉了本该返回的字段 —— 这三类都不抛异常，只是返回值不对。单元测试和 `import` 检查都拦不住。API 层的 TestClient 用例是唯一的防线，而它现在还是空的（0 条）。
+
+**2. 不要用框架内部结构做自检。** `app.routes` 的展开方式、`_IncludedRouter` 这类私有类的存在，都是实现细节。判断「端点是否可用」只有一个办法：发一次真请求。
+
+**3. 模块名不要与依赖包的顶层名相同。** 同名会互相遮蔽，且遮蔽发生在 import 顺序上 —— 同样的代码换个 import 顺序就从能跑变成报错，排查成本极高。
+
+**4. 响应模型的字段可空性要照抄下游契约。** `grams` 该不该 `None`，答案不在「正常情况有没有值」，在 `guard.py` 的类型注解和注释里。本次若按实测结果定成 `float`，下一个无量表述就会 500。
+
+**5. 上游异常的原文不该直接回传客户端。** 当前 `detail=[{'raw': str(e)}]` 会把 LangChain 的异常消息原样带出，里面可能有 `base_url`、模型名，极端情况可能含 key 片段。规范做法是 `detail` 只放 `type(e).__name__`，原文进服务端日志。当前没有日志设施，记为待办，第 5 块接 Docker + 日志时一起处理。
+
+### 五、今天产出的面试素材
+
+- **「你怎么保证新增的端点真的挂上了」**：不靠看代码，靠发请求。而且我不信任「列出路由表」这种自检 —— 实测当前 FastAPI 版本把 `include_router` 包装成 `_IncludedRouter` 不展开，按 `app.routes` 筛路径连能用的端点都筛不出来。判断标准只有一条：`TestClient` 打一次，看是不是 404。
+
+- **「502 和 500 你怎么分」**：按「客户端重试是否有意义」分，不是按「谁抛的异常」分。限流、超时、上游 5xx 重试可能成功 → 502；参数错、代码 bug 重试必然失败 → 4xx / 500。所以 `AIServiceError` 不能无脑映射成 500，`validate_meal` 的异常也不能映射成 502 —— 后者是护栏代码的 bug，把它报成上游故障会掩盖真实问题。
+
+- **「SSE 流式接口怎么处理中途失败」**：状态码在流开始时就固定了，中途异常无法改响应码。分两条路径：流开始前的异常走正常的 `502` 响应；流开始后写 `event: error` 数据帧让客户端感知。这决定了实现上要「先做完全部前置校验再打开流」，前置校验包括 key 存在性、模型可用性、参数合法性。
+
+- **「为什么 `errors.py` 里没有 `AIServiceError` 的处理器」**：`errors.py` 是横切模块，被所有路由依赖。让它 import `ai.pipeline` 等于把 AI 依赖塞进错误层 —— AI 层一旦有 import 期问题，整个错误处理机制跟着失效，所有端点连 4xx 都返回不出来。跨层异常在边界处翻译，不在横切模块里注册。

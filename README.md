@@ -129,7 +129,7 @@ python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果
 
 ## API
 
-`api/` 是 V1.5 新增的 REST 层，采用 `api → service / db / calc` 的单向依赖，下层不得回引。当前完成 **7 个确定性端点**（不调用 LLM），AI 三条链路因需要 SSE 流式，属下一批。
+`api/` 是 V1.5 新增的 REST 层，采用 `api → service / db / calc` 与 `api → ai` 的单向依赖，下层不得回引。当前完成 **8 个端点**：7 个确定性端点（不调用 LLM）+ 1 个 AI 解析端点（`/parse`，单次非流式调用）。对话链路因需要 SSE 流式，属下一批。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -140,6 +140,7 @@ python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果
 | GET | `/api/v1/intake?date=` | 查某日摄入明细（`date` 缺省为今天） |
 | DELETE | `/api/v1/intake/{id}` | 删除一笔摄入，成功返回 204 |
 | POST | `/api/v1/summary` | 某日汇总：明细 / 已摄入 / 缺口 |
+| POST | `/api/v1/parse` | 口语描述 → 结构化食物列表（调用 LLM，2~5s） |
 
 统一错误体（`code` 给机器分支，`message` 给人看）：
 
@@ -152,6 +153,7 @@ python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果
 | 422 | `VALIDATION_ERROR` | 字段类型错 / 越界 / 枚举非法 / 日期格式非法 |
 | 404 | `FOOD_NOT_FOUND` | 食物名不存在 |
 | 404 | `INTAKE_NOT_FOUND` | 删除的 id 不存在 |
+| 502 | `AI_UPSTREAM_ERROR` | AI 上游不可用（超时 / 限流 / key 缺失） |
 | 500 | `DATABASE_ERROR` | 数据访问失败 |
 | 500 | `INTERNAL_ERROR` | 未预期异常 |
 
@@ -160,7 +162,10 @@ python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果
 - **`response_model` 是白名单不是注解**：`db` 层 `SELECT *` 返回全部列，响应模型只声明对外字段，多出来的自动裁掉，表加列或加敏感字段都自动安全。
 - **输入约束只放在请求模型**：响应模型加 `gt/le` 会让「库里有一条超范围的旧记录」变成「接口 500」——那是否认自己的数据。
 - **`Literal` 代替 `str` 收枚举**：Swagger 自动渲染下拉框，非法值在进入函数体前被拦成 422，而不是在 `calc` 深处抛 `KeyError: 'moderate '`。
-- **端点用普通 `def` 而非 `async def`**：`db` 是 `sqlite3` 同步驱动、`service` 是纯 CPU 计算，全程无 `await`。写成 `async def` 会让请求在事件循环里串行排队，普通 `def` 由 FastAPI 自动丢进线程池。
+- **端点用普通 `def` 而非 `async def`**：`db` 是 `sqlite3` 同步驱动、`service` 是纯 CPU 计算、`ai` 是同步 LangChain 调用，全程无 `await`。写成 `async def` 会让请求在事件循环里串行排队，普通 `def` 由 FastAPI 自动丢进线程池。
+- **502 与 500 按「重试是否有意义」分**：`AIServiceError`（超时 / 限流 / key 缺失）映射 502，客户端重试可能成功；`validate_meal` 里抛出的异常映射 500，那是护栏代码的 bug，报成上游故障会掩盖真实问题。`errors.py` 本身不 import `ai`，AI 异常在路由层翻译，避免横切模块被 AI 依赖污染。
+
+> `/api/v1/parse` 需要 `DASHSCOPE_API_KEY`，未配置时返回 502 `AI_UPSTREAM_ERROR`。单次调用耗时约 2~5 秒，属正常。
 
 > 当前 Streamlit 仍直连 `db`/`service`，尚未切到 API。切换属后续步骤——先把服务端做稳，再动 UI 的数据来源。
 
@@ -178,7 +183,8 @@ Fitness_Diet_Assistant/
 │       ├── plan.py         # POST /plan
 │       ├── foods.py        # GET /foods · /foods/search
 │       ├── intake.py       # POST / GET / DELETE /intake
-│       └── summary.py      # POST /summary
+│       ├── summary.py      # POST /summary
+│       └── ai_parse.py     # POST /parse（调用 LLM）
 ├── pages/
 │   └── 1_AI_Mode.py        # AI 对话助手（独立页面）
 ├── service.py              # 业务编排层
