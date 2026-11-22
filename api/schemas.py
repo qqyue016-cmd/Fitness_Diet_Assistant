@@ -1,6 +1,9 @@
+import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
+
+from ai.guard import MAX_GRAMS
 
 
 class ProfileIn(BaseModel):
@@ -32,3 +35,58 @@ class FoodOut(BaseModel):
     fat: float
     carb: float
     source: str
+
+
+class IntakeCreate(BaseModel):
+    date: datetime.date
+    food_name: str = Field(..., min_length=1)
+    grams: float = Field(..., gt=0, le=MAX_GRAMS)
+
+
+class IntakeCreateOut(BaseModel):
+    id: int
+    date: datetime.date
+    food_name: str
+    grams: float
+
+
+class IntakeRecordOut(BaseModel):
+    id: int
+    date: datetime.date
+    food: str
+    grams: float
+
+
+class DailySummaryIn(BaseModel):
+    date: datetime.date
+    target: TargetOut
+
+
+class IntakeItemOut(BaseModel):
+    id: int
+    name: str
+    grams: float
+    kcal: float
+    protein_g: float
+    fat_g: float
+    carb_g: float
+
+
+class NutrientTotal(BaseModel):
+    kcal: float
+    protein_g: float
+    fat_g: float
+    carb_g: float
+
+
+class NutrientGap(BaseModel):
+    kcal: float
+    protein_g: float
+    fat_g: float
+    carb_g: float
+
+class DailySummaryOut(BaseModel):
+    date: datetime.date
+    items: list[IntakeItemOut]
+    total: NutrientTotal
+    gap: NutrientGap
