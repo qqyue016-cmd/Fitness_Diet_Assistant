@@ -1,11 +1,13 @@
 from langchain.agents import create_agent
 
+from ai.error import AIServiceError
+from ai.tools import UserCtx, today_report, report_by_date, search_foods_tool, query_food_tool, add_meal, delete_meal, \
+    search_knowledge
 from llm.factory import get_chat_model
-from ai.tools import UserCtx, today_report, report_by_date, search_foods_tool, query_food_tool,add_meal, delete_meal,search_knowledge
 
-TOOLS = [today_report, report_by_date, search_foods_tool, query_food_tool, add_meal, delete_meal,search_knowledge]
+TOOLS = [today_report, report_by_date, search_foods_tool, query_food_tool, add_meal, delete_meal, search_knowledge]
 
-SYSTEM_PROMPT =  """你是健身饮食助手，帮用户查询与记录饮食。
+SYSTEM_PROMPT = """你是健身饮食助手，帮用户查询与记录饮食。
 
 今天日期：{today}
 
@@ -38,6 +40,7 @@ SYSTEM_PROMPT =  """你是健身饮食助手，帮用户查询与记录饮食。
     用户自身的目标值、已摄入、缺口等具体数据，仍走数据类工具，不得用知识库内容替代。
 """
 
+
 def _make_agent(today: str, target: dict, goal: str):
     """构建 agent。每次新建（实测约 1.7ms），确保提示词里的日期不会过期。"""
     return create_agent(
@@ -55,7 +58,10 @@ def chat_stream(messages: list[dict], target: dict, today: str, goal: str = ""):
     {"type": "tool",        "name": "query_food_tool", "id": "call_xxx"}
     {"type": "tool_result", "content": "[{...}]", "id": "call_xxx"}
     """
-    agent = _make_agent(today, target, goal)
+    try:
+        agent = _make_agent(today, target, goal)
+    except Exception as e:
+        raise AIServiceError(str(e)) from e
     name_by_id = {}
 
     for chunk, meta in agent.stream(

@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
-from ai.pipeline import AIServiceError, parse_and_validate
+from ai.error import AIServiceError
+from ai.pipeline import parse_and_validate
 from api.errors import AIUpstreamError
 from api.schemas import ParseIn, ParseOut
 

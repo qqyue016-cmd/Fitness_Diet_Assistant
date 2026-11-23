@@ -4,10 +4,9 @@ import streamlit as st
 
 import db
 import service
-from ai.agent import chat_stream
-from ai.pipeline import parse_and_validate, AIServiceError
+from ai.error import AIServiceError
+from ai.pipeline import parse_and_validate
 from utils.config_tool import config_calc
-from utils.logger_tool import logger
 
 ACTIVITY_LABELS = {"sedentary": "久坐", "light": "轻度活动", "moderate": "中度活动",
                    "high": "高度活动", "extreme": "极高活动"}
@@ -15,7 +14,7 @@ GOAL_LABELS = {"muscle_gain": "增肌", "fat_loss": "减脂", "maintain": "维�
 
 st.set_page_config(page_title='Fitness_Diet_Assistant', page_icon='🥘', layout='wide')
 st.title(body='健身饮食助手', text_alignment='center')
-tab1, tab2= st.tabs(["我的计划", "今日记录"])
+tab1, tab2 = st.tabs(["我的计划", "今日记录"])
 
 # 侧边栏，存放用户画像
 with st.sidebar:
@@ -38,7 +37,7 @@ with st.sidebar:
     if st.button("生成计划", width="stretch"):
         st.session_state["plan"] = service.build_plan(gender, weight, height, age, activity, goal)
         st.session_state["goal_label"] = GOAL_LABELS[goal]
-    
+
     # app.py 里，放在显眼位置（比如 tabs 之前）
     st.page_link("pages/1_AI_Mode.py", label="问问 AI 助手", icon="💬")
 
@@ -207,4 +206,3 @@ with tab2:
             c[2].write(f"{d['protein_g']:.0f}")
             c[3].write(f"{d['fat_g']:.0f}")
             c[4].write(f"{d['carb_g']:.0f}")
-

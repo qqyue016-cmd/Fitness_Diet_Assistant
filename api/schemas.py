@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from ai.guard import MAX_GRAMS
 
+
 # 计划
 class ProfileIn(BaseModel):
     gender: Literal['male', 'female'] = Field(..., description='性别')
@@ -36,6 +37,7 @@ class FoodOut(BaseModel):
     carb: float
     source: str
 
+
 # 饮食记录
 class IntakeCreate(BaseModel):
     date: datetime.date
@@ -55,6 +57,7 @@ class IntakeRecordOut(BaseModel):
     date: datetime.date
     food: str
     grams: float
+
 
 # 每日总结
 class DailySummaryIn(BaseModel):
@@ -85,15 +88,18 @@ class NutrientGap(BaseModel):
     fat_g: float
     carb_g: float
 
+
 class DailySummaryOut(BaseModel):
     date: datetime.date
     items: list[IntakeItemOut]
     total: NutrientTotal
     gap: NutrientGap
 
+
 # parse
 class ParseIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=200, description='口语描述，如「中午吃了一碗米饭和两个鸡蛋」')
+
 
 class ParsedOKOut(BaseModel):
     raw: str
@@ -117,8 +123,21 @@ class ParsedInvalidOut(BaseModel):
     grams: float | None
     reason: str
 
+
 class ParseOut(BaseModel):
     ok: list[ParsedOKOut]
     ambiguous: list[ParsedAmbiguousOut]
     not_found: list[ParsedNotFoundOut]
     invalid: list[ParsedInvalidOut]
+
+
+# chat
+class ChatMessage(BaseModel):
+    role: Literal['user', 'assistant'] = Field(..., description='角色')
+    content: str = Field(..., min_length=1, max_length=2000, description='内容')
+
+class ChatIn(BaseModel):
+    messages: list[ChatMessage]= Field(..., min_length=1, max_length=50, description='全量对话历史')
+    target: TargetOut = Field(..., description='目标')
+    goal: str = Field('', max_length=20, description='目标类型，如「增肌」')
+

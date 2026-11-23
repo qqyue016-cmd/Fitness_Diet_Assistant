@@ -1,9 +1,10 @@
-import streamlit as st
 from datetime import datetime
+
+import streamlit as st
+
 from ai.agent import chat_stream
-from ai.pipeline import AIServiceError
-from utils.logger_tool import logger
 from rag.rag_service import parse_sources
+from utils.logger_tool import logger
 
 st.title("问问 AI")
 
@@ -23,7 +24,6 @@ else:
                 with st.expander(f"📖 参考资料（{len(m['sources'])} 条）"):
                     for s in m["sources"]:
                         st.markdown(f"**[{s['idx']}] {s['doc']} · {s['section']}**　\n{s['source']}")
-
 
     prompt = st.chat_input("问点什么…")
     if prompt:
