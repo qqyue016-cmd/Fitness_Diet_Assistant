@@ -2851,3 +2851,104 @@ app.routes 总数 : 9
 - **「SSE 流式接口怎么处理中途失败」**：状态码在流开始时就固定了，中途异常无法改响应码。分两条路径：流开始前的异常走正常的 `502` 响应；流开始后写 `event: error` 数据帧让客户端感知。这决定了实现上要「先做完全部前置校验再打开流」，前置校验包括 key 存在性、模型可用性、参数合法性。
 
 - **「为什么 `errors.py` 里没有 `AIServiceError` 的处理器」**：`errors.py` 是横切模块，被所有路由依赖。让它 import `ai.pipeline` 等于把 AI 依赖塞进错误层 —— AI 层一旦有 import 期问题，整个错误处理机制跟着失效，所有端点连 4xx 都返回不出来。跨层异常在边界处翻译，不在横切模块里注册。
+
+---
+
+## 2026-11-23 ｜ V1.5 第 2 块完成：`/chat` SSE 与一段死代码的排查
+
+### 一、目标与结果
+
+把 `ai/agent.py::chat_stream` 的事件流（`text` / `tool` / `tool_result`）转发为 SSE，让 AI 对话可以通过 HTTP 使用。
+
+**结果**：9 个端点全通，74 passed。真实链路「鸡胸肉多少卡」→ `tool 1 / tool_result 1 / text 17 / done 1`，6.3s，`curl -N` 下帧间隔 0.13s 左右逐块到达。
+
+### 二、完成的事
+
+1. **`ai/error.py` 独立**：`AIServiceError` 从 `ai/pipeline.py` 抽出。`agent` 与 `pipeline` 是平级编排层，前者只为借一个异常类而 import 后者属横向依赖，后面会变成循环风险。四处引用统一指向 `ai/error`，实测 `len({id(x) for x in 四处}) == 1`——**防的是同一模块被加载两份导致 `except` 漏接**。
+2. **`api/schemas.py`**：`ChatMessage`（`role: Literal['user','assistant']`）+ `ChatIn`。
+3. **`api/routes/ai_chat.py`**：SSE 包装。`done` 哨兵放在 `try` 外；`error` 帧带 `code` + `message`；响应头带 `X-Accel-Buffering: no`。
+4. **`ai/agent.py`**：把 `_make_agent` 的初始化异常包成 `AIServiceError`，否则流开始前的失败会变成「200 + 空 body」。
+5. **契约同步 5 处**：核心是把「错误的两条路径」改成「只有 422 + 流内 error 帧」，第 8 条验收从「缺 key 请求得 502」改成「缺 key 时启动失败属预期」。
+
+### 三、五个问题
+
+**问题一：`AIServiceError` 未定义，502 路径整体失效**
+
+`ai/agent.py:61` 写了 `raise AIServiceError(str(e))`，但文件头没有导入。实测抛的是 `NameError`：
+
+```
+AIServiceError 在 agent 模块里吗: False
+初始化失败时抛出 : NameError | name 'AIServiceError' is not defined
+```
+
+后果比想象中重：`NameError` 既不是 `AIServiceError` 也不是 `RuntimeError`，路由的 `except` 全拦不住，最后落到兜底 handler 变成 **500 `INTERNAL_ERROR`**。契约定的 502 等于没写。
+
+**`import api.main` 能过、74 条测试全绿**——因为这一行在函数体内，只有初始化失败时才求值。这是本项目第 3 次遇到「运行期才暴露」的错误（前两次：`db.create_intake` 拼错、`include_router` 漏写）。
+
+**问题二：路由里的前置校验是死代码**
+
+原设计是「路由里先调一次 `get_chat_model()` 做前置校验，覆盖 key 缺失」。实测发现这个假设不成立，证据链：
+
+```
+清空 DASHSCOPE_API_KEY → import api.main 直接崩：
+
+api/main.py:4 → api.routes.ai_parse → ai.pipeline → ai.parser:5
+  chat_model = get_chat_model()
+RuntimeError: 环境变量 DASHSCOPE_API_KEY 未设置，无法初始化模型
+```
+
+`ai/parser.py:5` 与 `:20` 是**模块级**实例化，`api.main` 的导入链必经它。两条推论：
+
+1. **缺 key 时没有进程能响应请求**——「请求 `/chat` 得 502」这个场景无法构造，验收第 8 条作废。
+2. **`get_chat_model` 是 `lru_cache`，`parser.py:5` 在 import 期已把它预热**——路由里那次调用必然命中缓存、必然不抛。四行预检**永远走不到**。
+
+决策：删掉预检（方案 A），接受「缺 key = 进程启动失败」的 fail-fast。代价写进契约的已知限制：缺 key 时 7 个确定性端点**也一起不可用**，公网 demo 上额度耗尽会导致整站起不来。备选方案 B（把 `parser.py` 的模型改为 `@lru_cache` 懒加载，让确定性端点不依赖 LLM）未采纳，已记在契约备查。
+
+**问题三：`TestClient` 测不出流式**
+
+用 `TestClient` 跑真实对话，所有帧的时间戳**全是 `9.71s`**：
+
+```
++ 9.71s '脂肪减少。\n\n但'
++ 9.71s '需注意：'
++ 9.71s '  \n❌ 不等于"不吃'
+```
+
+不是服务端没流式，是 `TestClient` 的 `iter_lines()` 会把整个响应缓冲完再逐行返回。换成 `curl -N` 打真实 uvicorn 才看到帧间隔 0.13s。**用错误的客户端测，会把「正常」误判成「故障」，也会反过来**——不加 `-N` 的 curl 自己也会缓冲。
+
+**问题四：`@router.post('')` 会把 `/api/v1` 本身注册成端点**
+
+空字符串路径在 `APIRouter(prefix='/api/v1')` 下等价于前缀本身。写出来 `openapi()` 里会出现 `POST /api/v1`，而 `/api/v1/chat` 是 404。
+
+**问题五：不处理初始化异常，客户端看到的是「200 + 空 body」**
+
+`chat_stream` 是生成器函数，**调用它不执行任何代码**，函数体在第一次 `next()` 时才跑，而 `StreamingResponse` 返回时响应头已经发出。实测：
+
+| 做法 | 客户端看到 |
+|---|---|
+| `StreamingResponse(gen_that_raises())` | **200 + 空 body**，错误完全不可见 |
+| 路由内先 `next(stream)` 再返 | 能在 200 之前捕获，但必须配 `JSONResponse(502)` |
+
+这比流内错误帧更差：连一个 `error` 帧都没有，`iter_lines()` 只是停止迭代、不抛异常。所以在 `ai/agent.py` 里把初始化异常包成 `AIServiceError`，让它在迭代过程中抛出，才能被 `sse()` 的 `except` 接住写成 `error` 帧。
+
+### 四、可迁移的规则
+
+**1. 判断「死代码」的标准是运行期能否为真，不是逻辑上是否该有。** 前置校验看起来天经地义（先验 key 再干活），但被校验对象的调用时机早就把异常提前引爆了：要么进程起不来，要么值已缓存。写之前先问「这个 `try` 里的东西，跑得到吗」。
+
+**2. 校验的有效性取决于被校验对象的生命周期。** `lru_cache` 一旦在 import 期被预热，任何「构造期校验」都退化成查表。同理，`if foods is None` 那类判断要看返回类型的实际契约，不是看名字。
+
+**3. 客户端的缓冲会伪装成服务端的问题。** `TestClient.iter_lines()`、不加 `-N` 的 curl、nginx 的 `proxy_buffering`，三层都能把流式变成「攒完一次吐」。`X-Accel-Buffering: no` 不是优化项，是让 nginx 不缓冲的开关。
+
+**4. 流式协议必须有结束哨兵。** 没有 `done`，「模型说完了」和「连接被掐断」在客户端看来完全一样。而且 `done` 只能放在成功路径上——出错时若也发 `done`，客户端就无法区分成败。
+
+**5. 异常类放在零依赖的独立模块。** 放 `pipeline` 会让 `agent` 横向依赖它；放 `agent` 会让 `pipeline` 反向依赖。独立成 `ai/error.py` 后，两个编排层各自 import，谁都不欠谁。
+
+### 五、面试素材
+
+- **「SSE 为什么不用 `event:` 字段，把类型塞进 data 里」**：因为客户端已有的分发逻辑是 `if ev["type"] == "text"`（Streamlit 页面直接消费生成器事件）。类型放 data 里，UI 从调生成器改成读 SSE 时，分发代码一行不用改；用 `event:` 字段要重写整套判断。代价是没用上 `EventSource.addEventListener`——但客户端是自写 `fetch` 流式读取，这个代价为零。
+
+- **「流式接口怎么表示失败」**：状态码在流开始时就固定了，中途异常改不了。所以有两条路径：流开始前的失败走正常 4xx/5xx 响应，流开始后的失败写 `error` 数据帧。更隐蔽的是第三种——生成器是惰性的，什么都不做的话，初始化失败会变成「200 + 空 body」，客户端连错误帧都收不到。
+
+- **「你怎么发现一段看起来对的代码其实是死的」**：不靠读，靠构造反例。这次是清空 key 跑一次，发现进程根本起不来；再顺着 import 链看到 `parser.py:5` 的模块级实例化，才推出「预检必然命中缓存」。**如果没去构造那个环境，这四行会一直留在代码里，注释还写着「覆盖 key 缺失」**。
+
+- **「为什么测试全绿还会出现运行期错误」**：本项目 4 次同类问题——`db.create_intake` 拼错、`include_router` 漏写、`AIServiceError` 未导入、`@router.post('')` 路径空。共同点是**单元测试不经过这些代码路径**。区别在于前两个能靠 `TestClient` 拦截，第三个要真调一次 LLM 才能触发。所以 API 层测试的最小集是「每个端点至少打一次」，而不是「每个函数的每个分支」。

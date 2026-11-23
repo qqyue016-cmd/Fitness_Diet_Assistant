@@ -1,65 +1,63 @@
 # 健身饮食助手 Fitness Diet Assistant
 
-围绕「**每日营养目标 → 实际摄入 → 缺口反馈**」闭环的健身饮食管理工具。支持**一句话自然语言记录**（LLM 解析 + 确定性护栏校验）、**AI 对话助手**（查食物营养、算缺口、直接帮记、答营养原理并标注出处），也保留传统表单录入。
+围绕「**每日营养目标 → 实际摄入 → 缺口反馈**」闭环的健身饮食管理工具。支持**一句话自然语言记录**（LLM 解析 + 确定性护栏校验）、**AI 对话助手**（查营养、算缺口、直接帮记、答营养原理并标注出处），也保留传统表单录入。核心原则：**确定性计算全部交给代码，AI 只做意图理解、参数抽取与解释**。
 
 ## 功能
 
-- **个性化营养计划**：基于 Mifflin-St Jeor 公式计算 BMR / TDEE，按目标（增肌 / 减脂 / 维持）自动调整每日热量与三大营养素分配
+- **个性化营养计划**：Mifflin-St Jeor 公式算 BMR / TDEE，按目标（增肌 / 减脂 / 维持）调整每日热量与三大营养素分配
 - **自然语言记录**：一句话描述饮食 → LLM 解析为结构化数据 → 护栏做库内匹配与范围校验 → 分级结果经用户确认后写库
-- **AI 对话助手**：支持多轮对话，流式输出；模型自主选择工具完成「查食物营养 / 查当日摄入与缺口 / 写入记录 / 撤销记录 / 检索营养知识」
-- **营养知识问答（RAG）**：内置 9 篇中文营养学主题语料（35 个知识块），向量检索后基于材料作答，并在界面展示「参考资料」——文档、小节与原始出处
-- **可复现评测**：30 题标注集（含 `gold_chunk` 与标准答案），检索层算 R@3 / R@1 / MRR，生成层用 LLM-as-judge 算 faithfulness / correctness，结果按时间戳落盘
-- **手动记录**：按日期选择食物 + 克数，支持删除回退
-- **缺口分析**：实时计算「已摄入 vs 目标」差值，正数为可摄入余量、负数为超出
-- **食物库**：内置 104 条常见食物的营养数据（每 100g 的热量 / 蛋白质 / 脂肪 / 碳水）
+- **AI 对话助手**：多轮对话、SSE 流式输出；模型自主调用 7 个工具完成「查营养 / 查摄入缺口 / 写记录 / 撤销记录 / 检索营养知识」
+- **营养知识问答（RAG）**：9 篇中文营养学语料（35 个知识块），向量检索后基于材料作答，界面展示「参考资料」——文档、小节与原始出处
+- **手动记录与缺口分析**：按日期选食物 + 克数，支持删除回退；实时计算「已摄入 vs 目标」差值
+- **REST API**：9 个端点，确定性端点 7 个 + AI 端点 2 个（含 SSE 流式对话）
+- **食物库**：内置 104 条常见食物（每 100g 的热量 / 蛋白质 / 脂肪 / 碳水）
+- **可复现评测**：30 题标注集，检索层算 R@3 / R@1 / MRR
 
 ## 技术栈
 
-Python 3 · SQLite · Streamlit · PyYAML · pytest
+Python 3 · SQLite · Streamlit · FastAPI · Pydantic · PyYAML · pytest
 
-**AI 部分**：LangChain / LangGraph（`create_agent` 工具编排）· `langchain-openai` 接入通义千问（阿里百炼 OpenAI 兼容模式，`qwen-plus`）· 自建模型工厂（`llm/factory.py`：配置驱动 + 按角色分档 + 单例缓存）
+**AI**：LangChain / LangGraph（`create_agent` 工具编排）· `langchain-openai` 接入通义千问（阿里百炼 OpenAI 兼容模式，`qwen-plus`）· 自建模型工厂（`llm/factory.py`：配置驱动 + 按角色分档 + 单例缓存）
 
-**RAG 部分**：Chroma（向量库，cosine）· 百炼 `text-embedding-v3`（1024 维）· 按 Markdown 标题的结构感知切分
+**RAG**：Chroma（cosine）· 百炼 `text-embedding-v3`（1024 维）· 按 Markdown 标题的结构感知切分
 
 ## 项目架构
 
-分层设计，依赖单向向下：
+四层，引用只能向下，不反向：
 
 ```
-app.py / pages/*.py  (UI · Streamlit)
-   │
-   ├──────────────┬──────────────┐
-   ▼              ▼              ▼
-service.py       ai/            rag/    (知识检索层)
-   │             │                 │
-   ▼             ▼                 ▼
-db.py · calc.py   │            Chroma（向量索引）
-   │             │                 │
-   │             └────────┬────────┘
-   │                      ▼
-   │                 llm/  (模型工厂)
-   │                      │
-   ▼                      ▼
-      config/ (YAML)  ·  utils/
+入口  api/        REST 层（FastAPI，9 个端点 / SSE 流式）
+      app.py      Streamlit UI（我的计划 / 今日记录）
+      pages/      AI 对话助手页
+                    │
+                    ▼
+编排  service.py  业务编排：计划生成 / 每日汇总
+      ai/         口语解析 · 确定性护栏 · 工具编排 · 对话流
+                    │
+                    ▼
+能力  rag/        检索 · 上下文拼装 · 出处解析
+      llm/        模型工厂（配置驱动 · 角色分档 · 单例）
+                    │
+                    ▼
+基础  db.py       SQLite 读写与日期规范化
+      calc.py     BMR / TDEE / 宏量 / 汇总 / 缺口（纯函数）
+      config/*.yaml · utils/
 ```
 
-**依赖方向的铁律**：`ai/` 可以依赖 `service` / `db` / `calc` / `rag` / `llm`；`rag/` 可以依赖 `llm`；`llm/` 只依赖 `utils/`。**反向绝不成立**——`rag/` 不向 `ai/` 索取任何东西，模型初始化也不散落在各业务模块中。
-
-这条约束的目的**不是**把 AI 能力做成可删除的插件（本项目 AI 与后端一体交付，不追求「删掉 AI 仍可运行」），而是**限制变更的传导范围**：换模型、换检索方案、重构 Agent 编排，都不需要动 `db` / `calc` / `service`。
+这条约束的目的**不是**把 AI 做成可删除的插件（本项目 AI 与后端一体交付），而是**限制变更的传导范围**：换模型、换检索方案、重构 Agent 编排，都不需要动 `db` / `calc` / `service`。
 
 | 层 | 文件 | 职责 |
 |---|---|---|
-| UI | `app.py` / `pages/*.py` | 页面渲染、交互、会话状态（多页面：主页 + AI 助手） |
-| AI | `ai/` | 自然语言解析、确定性护栏、工具编排、链路编排 |
-| RAG | `rag/` | 语料切片、向量建库、检索与上下文拼装、出处解析 |
-| LLM | `llm/` | 模型工厂：按角色构造 `ChatOpenAI` / `OpenAIEmbeddings`，配置驱动 + 单例缓存 |
-| 服务 | `service.py` | 组合数据与计算，输出结构化结果 |
-| 数据 | `db.py` | SQLite 读写、日期规范化 |
-| 计算 | `calc.py` | BMR / TDEE / 宏量分配 / 汇总 / 缺口（纯函数，无 I/O） |
-| 配置 | `config/*.yaml` | 数据库路径、表名、营养系数、数据源路径 |
-| 工具 | `utils/` | 配置加载、日志、路径解析 |
+| 入口 | `api/` | 路由、请求响应模型、统一错误契约 |
+| 入口 | `app.py` / `pages/*.py` | 页面渲染、交互、会话状态 |
+| 编排 | `service.py` | 组合数据与计算，输出结构化结果 |
+| 编排 | `ai/` | 自然语言解析、护栏、工具编排、链路编排 |
+| 能力 | `rag/` | 语料切片、向量建库、检索与上下文拼装、出处解析 |
+| 能力 | `llm/` | 按角色构造 `ChatOpenAI` / `OpenAIEmbeddings` |
+| 基础 | `db.py` · `calc.py` | 数据访问 / 纯计算 |
+| 基础 | `config/*.yaml` · `utils/` | 配置、路径解析、日志 |
 
-### `ai/` 模块组成
+### `ai/`
 
 | 文件 | 职责 |
 |---|---|
@@ -67,7 +65,8 @@ db.py · calc.py   │            Chroma（向量索引）
 | `guard.py` | 确定性护栏：库内匹配（精确 → 模糊 → 歧义）+ 克数校验 |
 | `pipeline.py` | 串联 `parser → guard`，对 UI 暴露单一入口 |
 | `tools.py` | 7 个工具（5 只读 + 2 写）+ `UserCtx` 上下文（`ToolRuntime` 注入） |
-| `agent.py` | `create_agent` 构建 + `chat_stream` 流式事件流（text / tool / tool_result，`tool_result` 带工具名） |
+| `agent.py` | `create_agent` 构建 + `chat_stream` 流式事件流 |
+| `error.py` | `AIServiceError`：AI 层对外唯一的异常类型，供 `agent` 与 `pipeline` 共用 |
 
 **工具清单**：
 
@@ -78,32 +77,23 @@ db.py · calc.py   │            Chroma（向量索引）
 | `today_report` | 无 | 今天的摄入与缺口（含明细 id） |
 | `report_by_date` | `date` | 指定日期 |
 | `search_knowledge` | `query` | 检索营养知识库，返回带编号与出处的段落 |
-| `add_meal` | `food`, `grams` | 写入记录（内部复用护栏 + 幂等检查） |
+| `add_meal` | `food`, `grams` | 写入记录（复用护栏 + 幂等检查） |
 | `delete_meal` | `record_id` | 撤销记录（id 必须来自查询结果） |
 
-工具的分工原则：**数据类问题走数据库（SQL），知识类问题走向量库（RAG）**。prompt 中明确「用户自身的目标值、摄入量必须走数据工具，不得用知识库中的通用数值替代」——否则模型会拿语料里的 BMR 公式自己算，而不是查实际记录。
+分工原则：**数据类问题走数据库，知识类问题走向量库**。prompt 明确「用户自身的目标值、摄入量必须走数据工具，不得用知识库中的通用数值替代」——否则模型会拿语料里的 BMR 公式自己算，而不是查实际记录。
 
-### `rag/` 模块组成
+### `rag/`
 
 | 文件 | 职责 |
 |---|---|
-| `vector_store.py` | 读 CSV 语料 → 按 `##` 二级标题切分 → 建 Chroma 索引（`search` / `build` / `get_retriever`） |
-| `rag_service.py` | `search` 检索 → `build_context` 拼装编号上下文 → `parse_sources` 反解析出处 → `search_nutrition_knowledge` 对 AI 层暴露 |
+| `vector_store.py` | 读 CSV 语料 → 按 `##` 二级标题切分 → 建 Chroma 索引 |
+| `rag_service.py` | `search` 检索 → `build_context` 拼装编号上下文 → `parse_sources` 反解析出处 |
 
 ### `llm/` 模型工厂
 
-| 文件 | 职责 |
-|---|---|
-| `factory.py` | `get_chat_model(role)` / `get_embedding_model()`：从 `config/llm.yaml` 取参数构造客户端，`lru_cache` 保证同角色单例 |
-| `config/llm.yaml` | 供应商 `base_url` 与 `api_key_env`、各角色的模型与参数、embedding 参数 |
+`get_chat_model(role)` / `get_embedding_model()` 从 `config/llm.yaml` 取参数构造客户端，`lru_cache` 保证同角色单例。三点约束：**换模型只改 YAML**（模型名、地址、温度、重试次数只有一个来源）；**按角色分档**（`default` 服务对话与解析，`judge` 服务评测判分，避免自我偏袒）；**`api_key` 缺失在构造期报错**（否则拖到首次调用才返回 401，离根因太远）。
 
-三点设计约束：
-
-1. **换模型只改 YAML**。上线初期 `qwen-plus` 曾因欠费被停，当时是直接改代码里的字符串常量；`base_url` 也在 chat 与 embedding 两处各写了一遍。现在模型名、地址、温度、重试次数都只有一个来源。
-2. **按角色分档**。`default` 服务对话与口语解析，`judge` 服务评测判分。判分与生成使用同一模型会产生自我偏袒，分档之后「换 judge 模型做对照实验」是改一行配置，而不是改代码。
-3. **`api_key` 缺失在构造期报错**。此前 `ChatOpenAI(api_key=None)` 构造并不报错，直到首次调用才返回 `401`，错误信息离根因很远。
-
-`check_embedding_ctx_length=False` 刻意**不**放进 YAML：它不是可调参数，而是「非 OpenAI 官方端点必须关闭」的服务约束，属代码不属配置。可调项进配置、必须项留代码，否则改 YAML 的人会以为所有字段都有效。
+`check_embedding_ctx_length=False` 刻意不放进 YAML：它是「非 OpenAI 官方端点必须关闭」的服务约束，属代码不属配置。
 
 ## 快速开始
 
@@ -116,20 +106,13 @@ streamlit run app.py               # UI，默认 8501
 uvicorn api.main:app --reload      # REST API，默认 8000
 ```
 
-评测（需要 `DASHSCOPE_API_KEY`）：
-
-```bash
-python -m evals.retrieval_eval     # 只跑检索层，不消耗生成额度
-python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果落盘到 evals/results/
-```
-
 浏览器打开 `http://localhost:8501`（UI）或 `http://localhost:8000/docs`（API 文档）。两个进程独立启动——Streamlit 的重跑模型会反复触发 FastAPI 启动，不要塞进同一个进程。
 
-> 使用自然语言记录功能，需配置环境变量 `DASHSCOPE_API_KEY`（阿里百炼）。未配置时手动记录与营养计划功能仍可正常使用。
+需要环境变量 `DASHSCOPE_API_KEY`（阿里百炼）。`ai/parser.py` 在模块级构造模型，缺该变量时应用无法启动。
 
 ## API
 
-`api/` 是 V1.5 新增的 REST 层，采用 `api → service / db / calc` 与 `api → ai` 的单向依赖，下层不得回引。当前完成 **8 个端点**：7 个确定性端点（不调用 LLM）+ 1 个 AI 解析端点（`/parse`，单次非流式调用）。对话链路因需要 SSE 流式，属下一批。
+`api/` 采用 `api → service / db / calc` 与 `api → ai` 的单向依赖。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
@@ -141,8 +124,29 @@ python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果
 | DELETE | `/api/v1/intake/{id}` | 删除一笔摄入，成功返回 204 |
 | POST | `/api/v1/summary` | 某日汇总：明细 / 已摄入 / 缺口 |
 | POST | `/api/v1/parse` | 口语描述 → 结构化食物列表（调用 LLM，2~5s） |
+| POST | `/api/v1/chat` | AI 对话，SSE 流式（调用 LLM） |
 
-统一错误体（`code` 给机器分支，`message` 给人看）：
+### `/chat` 的 SSE 帧
+
+`Content-Type: text/event-stream`，每帧一个 `data:` 行，事件类型放在 JSON 的 `type` 里：
+
+| type | 字段 | 说明 |
+|---|---|---|
+| `text` | `content` | 模型输出的文字片段 |
+| `tool` | `name`, `id` | 工具调用开始 |
+| `tool_result` | `content`, `name`, `id` | 工具返回，`content` 是引用溯源的来源 |
+| `done` | 无 | 正常结束哨兵 |
+| `error` | `code`, `message` | 流内异常。**出错时不发 `done`**，客户端据此区分「说完」与「断了」 |
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"鸡胸肉多少卡"}],"target":{"kcal":3010.2,"protein_g":126,"fat_g":63,"carb_g":484.8},"goal":"增肌"}'
+```
+
+### 错误契约
+
+统一错误体，`code` 给机器分支，`message` 给人看：
 
 ```json
 {"error": {"code": "FOOD_NOT_FOUND", "message": "食物不存在：榴莲", "detail": null}}
@@ -150,31 +154,25 @@ python -m evals.run_eval           # 全量 30 题（检索 + 生成），结果
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 422 | `VALIDATION_ERROR` | 字段类型错 / 越界 / 枚举非法 / 日期格式非法 |
+| 422 | `VALIDATION_ERROR` | 字段类型错 / 越界 / 枚举非法 / 日期格式非法 / 空白关键词 |
 | 404 | `FOOD_NOT_FOUND` | 食物名不存在 |
 | 404 | `INTAKE_NOT_FOUND` | 删除的 id 不存在 |
-| 502 | `AI_UPSTREAM_ERROR` | AI 上游不可用（超时 / 限流 / key 缺失） |
+| 502 | `AI_UPSTREAM_ERROR` | AI 上游不可用（超时 / 限流） |
 | 500 | `DATABASE_ERROR` | 数据访问失败 |
 | 500 | `INTERNAL_ERROR` | 未预期异常 |
 
-几个刻意的设计选择：
+三个关键做法：
 
-- **`response_model` 是白名单不是注解**：`db` 层 `SELECT *` 返回全部列，响应模型只声明对外字段，多出来的自动裁掉，表加列或加敏感字段都自动安全。
-- **输入约束只放在请求模型**：响应模型加 `gt/le` 会让「库里有一条超范围的旧记录」变成「接口 500」——那是否认自己的数据。
-- **`Literal` 代替 `str` 收枚举**：Swagger 自动渲染下拉框，非法值在进入函数体前被拦成 422，而不是在 `calc` 深处抛 `KeyError: 'moderate '`。
-- **端点用普通 `def` 而非 `async def`**：`db` 是 `sqlite3` 同步驱动、`service` 是纯 CPU 计算、`ai` 是同步 LangChain 调用，全程无 `await`。写成 `async def` 会让请求在事件循环里串行排队，普通 `def` 由 FastAPI 自动丢进线程池。
-- **502 与 500 按「重试是否有意义」分**：`AIServiceError`（超时 / 限流 / key 缺失）映射 502，客户端重试可能成功；`validate_meal` 里抛出的异常映射 500，那是护栏代码的 bug，报成上游故障会掩盖真实问题。`errors.py` 本身不 import `ai`，AI 异常在路由层翻译，避免横切模块被 AI 依赖污染。
-
-> `/api/v1/parse` 需要 `DASHSCOPE_API_KEY`，未配置时返回 502 `AI_UPSTREAM_ERROR`。单次调用耗时约 2~5 秒，属正常。
-
-> 当前 Streamlit 仍直连 `db`/`service`，尚未切到 API。切换属后续步骤——先把服务端做稳，再动 UI 的数据来源。
+- **`response_model` 是白名单不是注解**：`db` 层 `SELECT *` 返回全部列，响应模型只声明对外字段，多出来的自动裁掉——表加列或加敏感字段都自动安全。
+- **输入约束只放在请求模型**：响应模型加 `gt/le` 会让「库里有一条超范围的旧记录」变成「接口 500」。
+- **端点用普通 `def`**：`db` 是同步 `sqlite3`、`ai` 是同步 LangChain，全程无 `await`。写成 `async def` 会让请求在事件循环里串行排队，`def` 由 FastAPI 自动丢进线程池。
 
 ## 目录结构
 
 ```
 Fitness_Diet_Assistant/
 ├── app.py                  # Streamlit 应用入口（我的计划 / 今日记录）
-├── api/                    # REST 层（V1.5）
+├── api/                    # REST 层
 │   ├── main.py             # 应用装配 + 路由注册
 │   ├── deps.py             # 依赖（日期参数）
 │   ├── errors.py           # 统一错误契约 + 4 个处理器
@@ -184,9 +182,10 @@ Fitness_Diet_Assistant/
 │       ├── foods.py        # GET /foods · /foods/search
 │       ├── intake.py       # POST / GET / DELETE /intake
 │       ├── summary.py      # POST /summary
-│       └── ai_parse.py     # POST /parse（调用 LLM）
+│       ├── ai_parse.py     # POST /parse
+│       └── ai_chat.py      # POST /chat（SSE）
 ├── pages/
-│   └── 1_AI_Mode.py        # AI 对话助手（独立页面）
+│   └── 1_AI_Mode.py        # AI 对话助手
 ├── service.py              # 业务编排层
 ├── db.py                   # 数据访问层（SQLite）
 ├── calc.py                 # 计算层（纯函数）
@@ -195,7 +194,8 @@ Fitness_Diet_Assistant/
 │   ├── guard.py            # 确定性护栏
 │   ├── pipeline.py         # parser → guard 编排
 │   ├── tools.py            # 工具定义 + UserCtx 上下文
-│   └── agent.py            # Agent 构建 + 流式事件流
+│   ├── agent.py            # Agent 构建 + 流式事件流
+│   └── error.py            # AIServiceError
 ├── rag/                    # 知识检索层
 │   ├── vector_store.py     # 语料切分 + 向量建库 + 检索
 │   └── rag_service.py      # 上下文拼装 + 出处解析
@@ -204,30 +204,26 @@ Fitness_Diet_Assistant/
 ├── evals/                  # 评测（不参与运行时）
 │   ├── dataset.py          # 加载评测集 + 标注校验
 │   ├── retrieval_eval.py   # 检索层：R@1 / R@3 / MRR
-│   ├── generation_eval.py  # 生成层：faithfulness / correctness 双 judge
-│   ├── run_eval.py         # 两层串联、报告、落盘
-│   └── results/            # 每次运行的明细 JSON（含 meta，可跨版本对比）
+│   ├── generation_eval.py  # 生成层：faithfulness / correctness
+│   ├── run_eval.py         # 串联、报告、落盘
+│   └── results/            # 每次运行的明细 JSON
 ├── config/
 │   ├── SQLite.yaml         # 数据库路径与表名
 │   ├── calc.yaml           # 营养计算系数
 │   ├── foods.yaml          # 食物数据源路径
-│   ├── chroma.yaml         # 向量库参数（collection / k / 距离度量）
+│   ├── chroma.yaml         # 向量库参数
 │   ├── llm.yaml            # 模型供应商、各角色模型与参数
 │   └── evals.yaml          # 评测集路径
-├── utils/
-│   ├── config_tool.py      # 配置加载
-│   ├── path_tool.py        # 绝对路径解析
-│   └── logger_tool.py      # 日志
-├── scripts/
-│   └── init_db.py          # 建表 + 导入食物数据
-├── tests/                  # pytest 测试
+├── utils/                  # 配置加载 · 路径解析 · 日志
+├── scripts/init_db.py      # 建表 + 导入食物数据
+├── tests/                  # pytest
 ├── data/
 │   ├── foods.csv           # 食物营养数据（104 条）
 │   ├── foods.db            # SQLite 数据库
 │   ├── knowledge/          # 营养知识语料（9 篇 CSV）
-│   ├── eval_data/          # 评测集（30 题，含 gold_chunk 与标准答案）
+│   ├── eval_data/          # 评测集（30 题）
 │   └── chroma/             # 向量索引（可由语料重建，不入版本库）
-├── logs/                   # 运行日志
+├── logs/
 ├── requirements.txt
 ├── requirements-dev.txt
 └── DEVLOG.md               # 开发日志
@@ -237,50 +233,37 @@ Fitness_Diet_Assistant/
 
 ```bash
 pip install -r requirements-dev.txt
-pytest
+pytest          # 74 passed
 ```
 
-共 **73 条用例**，覆盖六个层面：
+| 文件 | 条数 | 覆盖 |
+|---|---|---|
+| `test_calc.py` | 24 | 计算公式的正常值与边界值（如碳水的负值保护） |
+| `test_db.py` | 23 | 增删查、日期规范化、越界输入、`LIKE` 通配符字面化 |
+| `test_guard.py` | 13 | 护栏的分级匹配、边界输入、规范名替换 |
+| `test_tools.py` | 7 | 工具写入前置校验、幂等、删除与回显字段 |
+| `test_service.py` | 6 | 服务层编排结果的结构与字段完整性 |
+| `test_rag_service.py` | 1 | `build_context` 与 `parse_sources` 的契约往返 |
 
-- `test_calc.py`（24）：计算公式的正常值与边界值（如碳水的负值保护）
-- `test_db.py`（22）：增删查、日期规范化、越界输入校验
-- `test_service.py`（6）：服务层编排结果的结构与字段完整性
-- `test_guard.py`（13）：护栏的分级匹配、边界输入、规范名替换
-- `test_tools.py`（7）：Agent 工具的写入前置校验、幂等、删除与回显字段
-- `test_rag_service.py`（1）：`build_context` 与 `parse_sources` 的契约往返一致性
-
-护栏的测试经过**变异测试**验证：故意在实现中植入缺陷，确认对应用例会失败——确保测试本身是有效的，而非摆设。
+护栏的测试经过**变异测试**验证：故意在实现中植入缺陷，确认对应用例会失败。
 
 ## 评测
 
-RAG 的效果不能靠「读起来还行」判断。项目内置双层评测：**检索层**衡量「该召回的资料有没有召回」，**生成层**衡量「回答是否被材料支持、是否与标准答案一致」。评测代码不参与运行时，删掉不影响应用。
+RAG 效果不能靠「读起来还行」判断。项目内置双层评测：**检索层**衡量「该召回的资料有没有召回」，**生成层**衡量「回答是否被材料支持、是否与标准答案一致」。评测代码不参与运行时，删掉不影响应用。
 
-### 评测集
-
-`data/eval_data/eval_set_v1.json`，30 题，每题标注 `gold_chunk`（对应向量库中的知识块）与 `ground_truth`：
-
-| 维度 | 分布 |
-|---|---|
-| 题型 | 事实型 11 · 误区判断型 7 · 应用型 6 · 换算型 2 · 对比型 2 · 机制型 2 |
-| 难度 | easy 11 · medium 14 · hard 5 |
-
-`check_dataset()` 在运行前做三项校验：必填字段、`id` 唯一、`gold_chunk` 必须真实存在于向量库。**标注错误的评测集比没有评测集更危险**——它会让指标看起来合理但毫无意义。
-
-### 指标定义
+评测集 `data/eval_data/eval_set_v1.json`，30 题，每题标注 `gold_chunk` 与 `ground_truth`。题型分布：事实型 11 · 误区判断型 7 · 应用型 6 · 换算型 2 · 对比型 2；难度 easy 11 / medium 14 / hard 5。`check_dataset()` 运行前三项校验：必填字段、`id` 唯一、`gold_chunk` 必须真实存在于向量库。
 
 | 层 | 指标 | 定义 |
 |---|---|---|
 | 检索 | Recall@3 | top-3 中包含 `gold_chunk` 的题目占比 |
 | 检索 | Recall@1 | `gold_chunk` 排在首位的题目占比 |
 | 检索 | MRR | 命中排名倒数的均值，未命中记 0 |
-| 生成 | faithfulness | 回答中的事实性断言被检索材料支持的比例（≥ 0.9 记为忠实） |
-| 生成 | correctness | 与 `ground_truth` 结论是否一致（LLM 判断并给出理由） |
+| 生成 | faithfulness | 回答中的事实性断言被检索材料支持的比例 |
+| 生成 | correctness | 与 `ground_truth` 结论是否一致 |
 
-两层分开测的原因：**召回成功不等于答对**。实测存在「忠实于检索材料、但与标准答案不一致」的样本，问题出在 top-3 里的干扰块，而不是没召回。
+两层分开测的原因：**召回成功不等于答对**——存在「忠实于检索材料、但与标准答案不一致」的样本，问题出在 top-3 里的干扰块。
 
-### 结果
-
-检索层（30 题，k=3，2026-10-27 复测）：
+检索层结果（30 题，k=3，cosine）：
 
 | 指标 | 值 |
 |---|---|
@@ -288,63 +271,30 @@ RAG 的效果不能靠「读起来还行」判断。项目内置双层评测：*
 | Recall@1 | 90.0%（27/30） |
 | MRR | 0.9333 |
 
-唯一未命中：id=6，`gold=02_s2`（减脂期宏量配比），实际召回 `09_s4` / `09_s1` / `02_s1`——同一主题被两篇文档覆盖导致的语义竞争，是后续 rerank / 查询改写的靶子。
-
-生成层**暂不公布基线**。框架完整可跑，但判分器经两轮修复后仍有系统性偏差，当前没有一组数字同时满足「有区分度」与「无已知污染」：
-
-| prompt 版本 | 失效方向 | 证据 |
-|---|---|---|
-| 10-27：示例含具体断言 | **假阳性**（有据判为无据） | 回答里根本没有 `9 kcal`，仍被判为无据断言 |
-| 11-08：换中性占位 | 占位符本身被抄 | 三轮重跑共 40 条无据断言，其中 5 条是占位符原文，影响 3 题 |
-| 11-16：去示例留格式占位 | **假阴性**（无据全部放过） | 30 题 `supported_ratio` 全为 1.0，`unsupported` 一条未判 |
-
-三轮重跑（11-08 版 prompt）的参考区间：faithfulness ≈ 0.89 / correctness ≈ 0.74，噪声地板 0.012 / 0.033——远小于此前估计的 0.04 / 0.07。**这批数字含 3 题已知污染，仅作参考，不作为基线发布。**
-
-处理方式：回滚至 10-27 版 prompt；分解式判分（抽原子断言 → 逐条判定 → 聚合）与人工标注黄金集列入后续版本。**单点验证发现不了判分器的系统性退化**——这是两轮排查最主要的教训，也是不发布未校准数字的直接原因。
-
-### 复现
+复现：
 
 ```bash
 python -m evals.retrieval_eval     # 只跑检索层：30 次 embedding，不消耗生成额度
-python -m evals.run_eval           # 全量：每题 1 次生成 + 2 次判分，约 3 分钟
+python -m evals.run_eval           # 全量：每题 1 次生成 + 2 次判分
 python -m evals.run_eval 5         # 只跑前 5 题，调 prompt 时用
 ```
 
-结果落到 `evals/results/eval_YYYYMMDD_HHMM.json`，`meta` 里记录模型、embedding、k、阈值——**数据不可比就等于没有数据**。
+结果落到 `evals/results/eval_YYYYMMDD_HHMM.json`，`meta` 记录模型、embedding、k、阈值。
 
-## 设计要点
+## 关键约定
 
-1. **数据完整性由数据库约束保证**。营养字段加 `NOT NULL`，因此计算层不做缺失值兜底——约束失效时应让错误尽早暴露，而非静默处理。
-2. **日期双端规范化**。写入用 `strftime` 严格输出 `YYYY-MM-DD`，读取时也用同一格式比对，保证 `WHERE date = ?` 的字符串全等比较可靠。
-3. **主键按实体身份设计**。`foods` 以食物名为主键（同名食物只保留唯一来源版本）；`intake` 用自增 `id` 作为记录身份，与「日期 + 食物 + 克数」这组属性解耦。
-4. **配置外置**。数据库路径、表名、营养系数全部写在 YAML 中，调整策略无需改动代码。
-5. **模型只负责转录，代码负责校验**。prompt 中明确「不要判断数值是否合理，只按原话转录」，所有权值与存在性判断都交给 `guard.py`——模型没有数据源的访问权，指望它在 prompt 里"输出库里的名字"是不可能实现的。
-6. **护栏输出分级结果**。`ok` / `ambiguous` / `not_found` / `invalid` 四级，把"这条能不能写库"翻译成用户可操作的四种决策，任何不确定的状态都**不静默写入**。
-7. **写操作必须由动作触发**。Streamlit 的 rerun 模型下，任何副作用（写库、调 API）都不能放在渲染路径上，否则每次交互都会重放一遍。
-8. **Agent 的写操作复用护栏，不裸调 DAO**。`add_meal` 内部依次判断「分配是否歧义 → 食物是否存在 → 克数是否合法 → 是否重复」，任一项不通过都返回说明字符串而非抛异常；`delete_meal` 的 `record_id` 必须来自查询结果，禁止模型编造。
-9. **事实由代码提供，模型只做理解与调度**。当前日期、用户目标、库内食物都通过 `ToolRuntime.context` 或工具查询获得，不依赖模型记忆；prompt 只负责约束行为，不承担事实存储。
-10. **切分策略取决于语料形状**。语料自带 `##` 二级标题时按结构切（35 块），不用按长度兜底切（会切出 79 块，其中 29 个碎片、15 处数字被切断，如 `1.6~2.2` 变成 `1.` + `6~2.2`）。`chunk_overlap` 是"怕切断"的补丁，结构切不需要。
-11. **metadata 不参与 embedding**。想让标题影响检索，必须把 `【文档 > 小节】` 拼进 `page_content`；写进 metadata 只能用于展示与过滤。实测带前缀使首位命中率（R@1）从 86.7% 提升到 96.7%。
-12. **RAG 上下文不进 system_prompt，而是作为工具返回值**。检索结果是动态材料，不是静态规则；塞进提示词会强制每轮携带、挤占对话空间，还会让模型混淆"必须遵守的约束"与"可引用的参考"。
-13. **引用出处由系统附带，不依赖模型标注**。实测在 prompt 明确要求"标注 `[1]`"后，模型一次都没写——引用不是模型的自然行为。改为从工具返回值中反解析 `parse_sources`，UI 独立展示「参考资料」，确定性 100%。
-
-## 已知局限
-
-- **模型对极端数值存在"合理化"倾向**：如输入 `-50克` 时，模型可能输出 `50`。这类错误发生在理解阶段，输出本身合法，护栏无法检出。缓解手段是 prompt 约束（只转录不判断）；根本解法需引入原文数值对账，当前版本未实现。
-- **食物名匹配只覆盖"库名包含输入"**：模型输出 `水煮鸡胸肉` 而库中为 `鸡胸肉` 时无法命中（反向包含未实现），会落入 `not_found` 由用户手动修正。
-- **回答会混入知识库外的内容**：知识库覆盖的是"量"与"配比"，模型仍可能用自身背景补充机制解释（如 `CCK/GLP-1` 饱腹激素），这部分没有出处。它读起来合理，但无法用检索材料核实——属于「正确但无据」，比编造错误数字更难发现。
-- **判分器对 prompt 示例极度敏感，尚未校准到位（2026-11-16 结论）**：`FAITHFULNESS_PROMPT` 的输出示例无论写什么，judge 都会向它靠拢。历了两轮失效：① 示例含具体断言时被**原样抄进输出**，回答里根本没有的说法被判为无据（假阳性）；② 换中性占位后，占位符本身被抄了 5 次；③ 彻底去掉示例、只保留格式占位后，30 题 `supported_ratio` 全部输出 1.0，**一条无据都判不出来**（假阴性）。当前已回滚至 10-27 版 prompt，分解式判分列入后续版本。**因判分器未校准，README 不发布生成层基线。**
-- **`faithfulness` / `correctness` 是估计值，不是真值**：三次同配置重跑（11-08 版 prompt）的极差为 faithfulness 0.012 / correctness 0.033，但 **8/30 题的单题结果三次不一致**，其中 id = 9 / 24 / 27 / 28 / 30 的 `correctness` 发生翻转。因此只能使用聚合指标，单题结果不可作结论。检索层则完全确定性，三次 R@3 / R@1 / MRR 逐位相同。
+1. **模型只负责转录，代码负责校验**。prompt 明确「只按原话转录，不判断数值是否合理」，所有权值与存在性判断交给 `guard.py`——模型没有数据源的访问权。
+2. **护栏输出分级结果**。`ok` / `ambiguous` / `not_found` / `invalid` 四级，任何不确定状态都**不静默写入**。
+3. **写操作必须由动作触发**。Streamlit 的 rerun 模型下，副作用不能放在渲染路径上，否则每次交互都会重放。
+4. **引用出处由系统附带，不依赖模型标注**。实测在 prompt 要求「标注 `[1]`」后模型一次都没写；改为从工具返回值反解析 `parse_sources`，UI 独立展示「参考资料」，确定性 100%。
+5. **metadata 不参与 embedding**。想让标题影响检索必须拼进 `page_content`；实测带前缀使 R@1 从 86.7% 提升到 96.7%。语料有 `##` 二级标题时按结构切（35 块），不用按长度兜底切（会切出 79 块，其中 15 处数字被切断）。
 
 ## 版本
 
-| 版本 | 状态 | 主要内容 |
-|---|---|---|
-| **V1** | 已完成 | 确定性内核：食物库 · 营养计算 · 摄入记录 · 缺口分析 · Streamlit |
-| **V2** | 已完成 | 自然语言解析 · 确定性护栏 · 分级确认 UI · Tool Calling（7 个工具）· 流式多轮对话 · 对话式写库 · **营养知识 RAG（含引用溯源）** · **双层评测框架（检索 R@3 96.7%，三次复测零波动）** · **模型工厂（配置驱动 + 角色分档）** · 74 条单测<br>已知缺口：生成层判分器未校准，不发布基线（见「已知局限」）；Rerank 待判分器就绪后做对照 |
-| **V1.5** | 进行中 | 已完成：**REST 层**（7 个确定性端点 · Pydantic 校验 · 统一错误契约 · 全链路数值验收）<br>待做：AI 三链路 SSE · Streamlit 改调 API · Docker · 公网 demo · JWT · MySQL / Redis |
-| V3 | 待开始 | 查询改写（口语 → 检索式表达）· 多步编排（LangGraph，跨工具的组合任务） |
+| 版本 | 主要内容 |
+|---|---|
+| **V1** | 确定性内核：食物库 · 营养计算 · 摄入记录 · 缺口分析 · Streamlit |
+| **V2** | 自然语言解析 · 确定性护栏 · 分级确认 UI · Tool Calling（7 个工具）· 流式多轮对话 · 对话式写库 · 营养知识 RAG（含引用溯源）· 双层评测框架 · 模型工厂 · 74 条单测 |
+| **V1.5** | REST 层：9 个端点（含 SSE 流式对话）· Pydantic 校验 · 统一错误契约 · 全链路数值验收 |
 
 设计思路：先用确定性代码把领域逻辑固化好，再让 LLM 承担调度层——比直接堆 prompt 更可控、可测试。
-
-技术选型原则：**每引入一项技术（RAG / Rerank / 查询改写）都用对照实验量化收益，并且先确定指标能反映问题**。检索层 R@3 = 96.7%（29/30），35 个知识块的规模下已接近上限，单看 R@3 无法给 Rerank 留下空间；但「忠实于资料却答错」的样本说明**干扰块会误导模型**，而 R@3 只衡量「有没有召回」，不衡量「排得对不对」——所以 Rerank 的对照实验应看 `faithful_wrong` 的数量变化，而不是 R@3。该实验的前提是判分器先修复，否则测量的是噪声——示例泄漏已于 2026-11-08 修复，前置条件满足；但仍需先跑出三次均值作为噪声地板，再谈差值。
