@@ -2952,3 +2952,112 @@ RuntimeError: 环境变量 DASHSCOPE_API_KEY 未设置，无法初始化模型
 - **「你怎么发现一段看起来对的代码其实是死的」**：不靠读，靠构造反例。这次是清空 key 跑一次，发现进程根本起不来；再顺着 import 链看到 `parser.py:5` 的模块级实例化，才推出「预检必然命中缓存」。**如果没去构造那个环境，这四行会一直留在代码里，注释还写着「覆盖 key 缺失」**。
 
 - **「为什么测试全绿还会出现运行期错误」**：本项目 4 次同类问题——`db.create_intake` 拼错、`include_router` 漏写、`AIServiceError` 未导入、`@router.post('')` 路径空。共同点是**单元测试不经过这些代码路径**。区别在于前两个能靠 `TestClient` 拦截，第三个要真调一次 LLM 才能触发。所以 API 层测试的最小集是「每个端点至少打一次」，而不是「每个函数的每个分支」。
+
+---
+
+## 2026-11-25 ｜ V1.5 第 3 块：API 层测试（19 条）
+
+### 目标与结果
+
+补齐 `tests/test_api.py`。此前 74 条全是单元测试，**API 层覆盖率为 0**，而过去一周的错误全都发生在这个区间：`db.create_intake` 拼错、`include_router` 漏写、`AIServiceError` 未导入、`@router.post('')` 路径空。
+
+| 项 | 结果 |
+|---|---|
+| 新建 `tests/test_api.py` | 19 条，覆盖 6 个确定性端点 |
+| 全量测试 | **93 passed**（74 + 19） |
+| 变异验证 | 3 处植入缺陷，对应测试均变红 |
+| 发现并修复 | 1 条**假绿**用例（断言全部失效但仍通过） |
+
+用例分布：`/plan` 3、`/foods` 2、`/foods/search` 4、`/intake` 9、`/summary` 1。`/parse` 与 `/chat` 留待下一段——它们依赖 LLM，不能随手重跑。
+
+### 完成的事
+
+1. `client` fixture 用 module scope：`app` 是全局单例、`TestClient` 无状态，逐用例重建只是浪费。代价是后续 `/parse` 那批 monkeypatch 必须保证复原，否则污染同模块。
+2. `assert_422(r)` helper 统一校验 `status_code` + `code` + `message`。`/intake` 有 3 条、`/summary` 1 条走这个 helper，省掉四处重复。
+3. 数值断言写到位：`bmr 1688.75` / `tdee 2617.5625` / `target 3010.196875`，以及 `鸡胸肉 200g + 白米饭 150g → total 525.0 / 66.05 / 7.65 / 42.3`。只断言 200 的测试，在 `activity_factors` 的 `moderate` 从 `1.55` 改成 `1.5` 时不会变红。
+4. `TEST_DATE` 手写常量而非 `from conftest import`：`conftest.py` 不是普通可导入模块，这条导入依赖 rootdir 进 `sys.path`，换个运行方式就断。
+5. 删除 `db.create_intake` 那类错误的检查方式从「手点 `/docs`」改为「`pytest` 一次跑完」。
+
+### 问题
+
+**问题一：同名类静默覆盖，三条用例消失**
+
+`/plan` 和 `/foods` 两组都写成了 `class TestPlan:`，第二个覆盖第一个。`--collect-only` 显示 16 条（应为 19），`/plan` 的三条**完全不存在**。
+
+Python 里类名只是模块属性，第二次赋值直接覆盖，不报错、不警告。**唯一可靠的检查是数条数**——写之前先算好应该有几位数，跑 `--collect-only` 对一遍。
+
+同类问题还有 `def test_summary_numbers(self, client)` 定义在模块级：`self` 被 pytest 当作 fixture 名去解析，直接 `ERROR: fixture 'self' not found`。
+
+**问题二：假绿用例——`all()` 对空列表恒真**
+
+`test_intake_get_ok` 原本在用例内不造数据，直接 `GET` 后断言：
+
+```python
+assert all(isinstance(i['id'], int) for i in items)      # all([]) → True
+assert all(i['date'] == TEST_DATE for i in items)        # all([]) → True
+assert all(i['food_name'] == '鸡胸肉' for i in items)     # all([]) → True
+```
+
+三个条件叠加，导致它必然拿到空列表：
+
+1. `conftest.py` 的 `clean_intake` 是 **autouse**，每个用例**结束后**删除 `TEST_DATE` 的记录
+2. 该用例自己不造数据，执行时这个日期必然是空的
+3. `all()` 对空列表返回 `True`，三条断言全部成立
+
+于是这条用例**永远绿，且零验证力**。更糟的是第 130 行的字段名写成了 `food_name`——`GET /intake` 返回的是 `food`：
+
+```
+items: [{'id': 1043, 'date': '1900-01-01', 'food': '鸡胸肉', 'grams': 100.0}]
+有 food 键   : True
+有 food_name : False
+```
+
+这个 `KeyError` 因为从未有元素被访问，一次都没触发过。
+
+修法是两步：用例内先 `POST` 造数据，并且**把 `assert len(items) == 1` 放在所有 `all()` 之前**。变异验证：把 `items[0]['food']` 改回 `food_name`，测试立刻 `KeyError` 变红——这才证明它活了。
+
+**问题三：`assert_422` 的 `detail` 假设不成立**
+
+helper 原本断言 `detail` 非空，理由是「非空说明走了 `RequestValidationError` handler」。但空白 keyword 那条直接失败：
+
+```
+空白 keyword : {'code': 'VALIDATION_ERROR', 'message': 'keyword 不能为空白', 'detail': None}
+limit=99     : detail 类型 list，长度 1
+```
+
+同一个 `VALIDATION_ERROR`，两种来源、两种结构：
+
+| 来源 | `detail` |
+|---|---|
+| `RequestValidationError`（`limit=99`、`grams=-1`） | list，含字段级 `loc` / `type` |
+| `InvalidParam`（空白 keyword） | `None` |
+
+这暴露的是一个**契约缺陷而非测试缺陷**：客户端不该为同一个 `code` 写两条解析分支。当前的处理是把 helper 收窄为断言 `message`（所有 422 都有），把「让 `InvalidParam` 也带结构化 `detail`」记进待改清单——测试写完再改实现，否则「失败是因为实现变了还是测试写错了」判断不清。
+
+**问题四：`foods_name` 多一个字母**
+
+`json={'food_name': ...}` 写成 `foods_name`，Pydantic 判「必填字段缺失」返回 422，被误读成「参数值非法」。两者都是 422、`code` 都是 `VALIDATION_ERROR`，只能靠 `detail[0]['type']` 区分：`missing` 是键不存在，`greater_than` 是值越界。
+
+这是第 5 次同类 typo（`create_intake`、`daliy_summary`、`chatmessage`、`moodel`）。共同点是 IDE 补全帮不上忙——它只补已存在的名字，不检查你传的字符串键。
+
+**问题五：`pytest.approx` 用在字符串上**
+
+`assert b['name'] == pytest.approx('鸡胸肉')` 能通过（approx 对 str 回退到 `==`），但语义错位：approx 的存在意义是容忍浮点误差，对字符串只会让读者以为这里有精度问题。
+
+### 可迁移规则
+
+1. **用 `all()` 断言列表前，必须先断言列表非空。** `all([])` 恒真，这让「断言写得越全，假绿越彻底」——因为多条断言全部失效后，测试反而更绿。
+2. **同名类/函数不报错，只覆盖。** 写完先算应有条数，用 `--collect-only` 核对。pytest 收集数少于预期时，第一嫌疑就是重名。
+3. **断言的对象必须是「实现改动后会变的东西」。** 验证缺省日期，落脚点就得是返回数据里的 `date` 字段；只断言 `status_code == 200` 时，把缺省值从「今天」改成「1900-01-01」测试照样绿。
+4. **同一个错误 `code` 的响应体结构应当同构。** 结构不同是契约缺陷，客户端要为同一个状态写两条解析路径，这属于设计债。
+5. **分层测试：底层锁行为，上层验接线。** `search_foods('%')` 的字面匹配由 `test_db.py` 锁住，API 层不重复测；`limit` 切片这类路由层逻辑才归 `test_api.py`。
+
+### 面试素材
+
+- **「测试全绿但零验证力，你怎么发现」**：不靠读测试代码，靠变异。故意改坏实现，看测试红不红。这次抓到的是 `all()` 对空列表恒真——三条断言叠加之后，连 `KeyError` 都被绕过。**判断一条测试有没有用，唯一标准是「实现改动它会不会红」**。
+
+- **「你怎么证明测试有效」**：变异测试（mutation testing）的手工版。三个动作：注释路由注册、改公式系数、改字段名，每个都确认对应用例变红。全绿的测试报告不证明任何事，能让实现错就红的测试才证明。
+
+- **「集合端点搜不到为什么返回 200 而不是 404」**：404 是「资源不存在」，`[]` 是「条件命中 0 条」。集合端点返回 404 会破坏语义，前端无法区分「没搜到」和「搜索服务挂了」。GitHub API 的 `/search` 同样如此。
+
+- **「DELETE 第二次为什么返回 404 而不是 204」**：两种设计都合理。204 更符合 HTTP 幂等性；404 让客户端能区分「删掉了」与「本来就没有」，在「点删除发现记录不存在」这个交互里，后者信息量更大。测试锁的是当前选择，将来改设计时它会提醒同步改。
